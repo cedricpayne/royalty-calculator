@@ -82,6 +82,36 @@ Each Telegram chat has its own isolated catalog. Data is stored in SQLite
 | `/deletefile <id>` | Remove a statement and its transactions |
 | `/reset` | Delete everything for this chat (requires `/reset confirm`) |
 
+## Deploy on Railway
+
+The repo ships with `railway.json` (start command + restart policy), a `Procfile`
+(worker process, no public port needed — the bot uses polling) and
+`.python-version`, so Railway's builder picks everything up automatically.
+
+1. **Create the service** — on [railway.com](https://railway.com): *New Project →
+   Deploy from GitHub repo* and select this repository. Railway detects Python
+   from `requirements.txt` and uses `python -m royaltycalc.bot` as the start
+   command.
+2. **Set the token** — in the service's *Variables* tab add:
+   ```
+   TELEGRAM_BOT_TOKEN=123456:ABC-your-token
+   ```
+3. **Add a volume (important).** Railway's container filesystem is ephemeral —
+   without a volume, every deploy/restart wipes the SQLite database and all
+   ingested statements. In the service: *right-click → Attach Volume*, mount it at
+   `/data`, then add a second variable:
+   ```
+   ROYALTY_DB=/data/royalties.db
+   ```
+4. **Deploy.** Watch the deploy logs for `Bot starting (db=/data/royalties.db)`,
+   then message your bot on Telegram.
+
+Notes:
+- Run **exactly one instance** (Railway's default). Two replicas polling the same
+  bot token will fight over updates, and SQLite on a volume is single-writer.
+- Pushes to your default branch auto-deploy; the volume keeps your data across
+  deploys.
+
 ## CLI (same engine, no Telegram needed)
 
 ```bash

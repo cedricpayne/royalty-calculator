@@ -262,6 +262,13 @@ def main() -> None:
         raise SystemExit(
             "Set TELEGRAM_BOT_TOKEN (get one from @BotFather on Telegram) and retry."
         )
+    if "ROYALTY_DB" not in os.environ:
+        log.warning(
+            "ROYALTY_DB is not set - using local %s. On ephemeral hosts "
+            "(e.g. Railway) attach a persistent volume and point ROYALTY_DB "
+            "at it, or all data is lost on every redeploy.",
+            DB_PATH,
+        )
     app = build_application(token)
     log.info("Bot starting (db=%s)", DB_PATH)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
