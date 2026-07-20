@@ -130,10 +130,16 @@ to 20 MB per file. Three ways around it:
 1. **Zip and split** — CSVs compress ~10x, so 750 MB of statements is usually
    4-8 zips under 20 MB. Send them all in one message; the bot processes each
    archive's contents individually.
-2. **`/fetch <url>`** — put the file (or one big zip) anywhere with a direct
-   download link (Dropbox `?dl=1`, Google Drive direct link, an S3 presigned
-   URL) and the bot downloads it itself. Default cap 1 GB, configurable with
-   `ROYALTY_MAX_FETCH_MB`.
+2. **`/fetch <url>`** — put the file (or one big zip) anywhere reachable by
+   link and the bot downloads it itself. Direct links (S3 presigned URLs, raw
+   file URLs) always work; share pages (Hightail Spaces, Dropbox, Drive) are
+   resolved automatically — the bot scans the page for the real download link
+   and follows it. Dropbox links get `dl=1` added for you. Files are accepted
+   by content type as well as extension, so extension-less download endpoints
+   work. Default cap 1 GB, configurable with `ROYALTY_MAX_FETCH_MB`. Share
+   pages that require a login or build their download links entirely in
+   JavaScript can't be resolved — download locally and send the files, or use
+   a direct link.
 3. **Self-hosted Bot API server** (advanced) — run
    [telegram-bot-api](https://github.com/tdlib/telegram-bot-api) alongside the
    bot and set `TELEGRAM_API_BASE_URL` / `TELEGRAM_API_BASE_FILE_URL`; the

@@ -14,7 +14,6 @@ import html
 import json
 import logging
 import os
-import re
 import tempfile
 from decimal import Decimal
 from pathlib import Path
@@ -30,6 +29,7 @@ from telegram.ext import (
 )
 
 from .categorize import CATEGORIES, resolve_category_name
+from .fetch import ShareResolveError, download_statement
 from .ingest import UPLOAD_EXTENSIONS, ingest_upload
 from .report import build_report, fmt_money, render_report
 from .store import Store
@@ -67,7 +67,7 @@ or use /fetch with a direct download link (Dropbox/Drive/S3), which has no \
 
 Commands:
 /report - LTM total, category breakdown and per-year earnings
-/fetch <url> - ingest a statement or zip from a direct download link
+/fetch <url> - ingest from a link (direct file links and share pages like Hightail/Dropbox/Drive)
 /uncategorized - transactions needing manual review
 /categorize <id> <category> - assign a category (masters, publishing, producer, neighbouring, other)
 /trace <id> - show the original file, row and raw data for a transaction
@@ -216,57 +216,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
 
-def _filename_from_response(url: str, content_disposition: str | None) -> str:
-    if content_disposition:
-        m = re.search(r'filename\*?="?([^";]+)"?', content_disposition)
-        if m:
-            return Path(m.group(1).strip()).name
-    from urllib.parse import unquote, urlparse
-
-    return Path(unquote(urlparse(url).path)).name or "statement"
-
-
-def _download_blocking(url: str, dest_dir: Path) -> tuple[Path, str]:
-    """Stream a URL to disk with a size cap. Runs on a worker thread."""
-    import httpx
-
-    with httpx.Client(
-        follow_redirects=True, timeout=httpx.Timeout(30.0, read=300.0)
-    ) as client:
-        with client.stream("GET", url) as resp:
-            resp.raise_for_status()
-            filename = _filename_from_response(str(resp.url), resp.headers.get("content-disposition"))
-            if Path(filename).suffix.lower() not in UPLOAD_EXTENSIONS:
-                raise ValueError(
-                    f"The link serves '{filename}', which is not a supported type. "
-                    "Use a direct link to a CSV/TSV/Excel file or a .zip of statements."
-                )
-            length = resp.headers.get("content-length")
-            if length and int(length) > MAX_FETCH_BYTES:
-                raise ValueError(
-                    f"File is {int(length) / (1024*1024):,.0f} MB, above the "
-                    f"{MAX_FETCH_BYTES >> 20} MB /fetch limit."
-                )
-            target = dest_dir / filename
-            written = 0
-            with open(target, "wb") as fh:
-                for chunk in resp.iter_bytes(1 << 20):
-                    written += len(chunk)
-                    if written > MAX_FETCH_BYTES:
-                        raise ValueError(
-                            f"Download exceeded the {MAX_FETCH_BYTES >> 20} MB /fetch limit."
-                        )
-                    fh.write(chunk)
-    return target, filename
-
-
 async def cmd_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args or []
     if not args or not args[0].lower().startswith(("http://", "https://")):
         await update.message.reply_text(
-            "Usage: /fetch <direct download link>\n"
-            "The link must point straight at a CSV/TSV/Excel file or a .zip of "
-            "statements (for Dropbox use dl=1, for Google Drive a direct-download link)."
+            "Usage: /fetch <link>\n"
+            "Works with direct file links and with share pages (Hightail, "
+            "Dropbox, Drive...) - I'll look for the download link myself. "
+            "The file must be a CSV/TSV/Excel statement or a .zip of statements."
         )
         return
     url = args[0]
@@ -274,14 +231,26 @@ async def cmd_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Downloading... large files can take a few minutes.")
     with tempfile.TemporaryDirectory() as tmp:
         try:
-            local, filename = await asyncio.to_thread(_download_blocking, url, Path(tmp))
+            local, filename = await asyncio.to_thread(
+                download_statement, url, Path(tmp), MAX_FETCH_BYTES
+            )
+        except ShareResolveError as e:
+            await update.message.reply_text(
+                f"{e}\n\nShare pages that need a login or run entirely in the "
+                "browser can't be fetched. Easiest alternatives:\n"
+                "1) Download the files to your device, zip them, and send the "
+                "zip(s) here directly;\n"
+                "2) Re-share via a direct link (Dropbox link with ?dl=1, an S3 "
+                "presigned URL, or any raw file URL) and /fetch that."
+            )
+            return
         except ValueError as e:
             await update.message.reply_text(str(e))
             return
         except Exception as e:
             log.warning("Fetch failed for %s: %s", url, e)
             await update.message.reply_text(
-                f"Download failed: {e}\nCheck that the link is a direct, public download."
+                f"Download failed: {e}\nCheck that the link is public and reachable."
             )
             return
         results = await asyncio.to_thread(
