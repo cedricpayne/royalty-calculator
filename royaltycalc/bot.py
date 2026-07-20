@@ -9,6 +9,7 @@ Each Telegram chat gets its own isolated catalog (keyed by chat id).
 
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import logging
@@ -28,9 +29,9 @@ from telegram.ext import (
 )
 
 from .categorize import CATEGORIES, resolve_category_name
-from .ingest import SUPPORTED_EXTENSIONS, ingest_file, summary_text
+from .ingest import UPLOAD_EXTENSIONS, ingest_upload
 from .report import build_report, fmt_money, render_report
-from .store import DuplicateFileError, Store
+from .store import Store
 
 logging.basicConfig(
     format="%(asctime)s %(name)s %(levelname)s %(message)s", level=logging.INFO
@@ -43,8 +44,10 @@ HELP_TEXT = """\
 Music Catalog Earnings Bot
 
 Send me royalty statement files (CSV, TSV or Excel) from any producer, artist, \
-publisher, distributor or label. I combine them - even with different column \
-names - skip duplicate files/transactions, and report your earnings.
+publisher, distributor or label. You can send several files in one message, or \
+a .zip containing any number of statements. I combine them - even with \
+different column names - skip duplicate files/transactions, and report your \
+earnings.
 
 Commands:
 /report - LTM total, category breakdown and per-year earnings
@@ -70,44 +73,88 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(HELP_TEXT)
 
 
+TELEGRAM_MESSAGE_LIMIT = 4000  # keep headroom under Telegram's 4096-char cap
+BATCH_FLUSH_SECONDS = 2.5      # quiet time before replying to a multi-file album
+
+
+def _chunk_text(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
+    """Split a long reply into Telegram-sized chunks on blank-line boundaries."""
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    current: list[str] = []
+    length = 0
+    for block in text.split("\n\n"):
+        if current and length + len(block) + 2 > limit:
+            chunks.append("\n\n".join(current))
+            current, length = [], 0
+        current.append(block)
+        length += len(block) + 2
+    if current:
+        chunks.append("\n\n".join(current))
+    return chunks
+
+
+async def _send_chunked(bot, chat_id: int, text: str) -> None:
+    for chunk in _chunk_text(text):
+        await bot.send_message(chat_id, chunk)
+
+
+async def _flush_batch(context: ContextTypes.DEFAULT_TYPE, chat_id: int, group_id: str) -> None:
+    """After a quiet period, send one combined reply for a multi-file album."""
+    try:
+        await asyncio.sleep(BATCH_FLUSH_SECONDS)
+    except asyncio.CancelledError:
+        return  # another file from the same album arrived; a new flush is armed
+    batches = context.chat_data.get("upload_batches", {})
+    entry = batches.pop(group_id, None)
+    if not entry or not entry["lines"]:
+        return
+    n = entry["count"]
+    text = "\n\n".join(entry["lines"]) + (
+        f"\n\nProcessed {n} file(s). Send /report for the updated totals."
+    )
+    await _send_chunked(context.bot, chat_id, text)
+
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     doc = update.message.document
     chat_id = update.effective_chat.id
     filename = doc.file_name or "statement"
     suffix = Path(filename).suffix.lower()
-    if suffix not in SUPPORTED_EXTENSIONS:
-        await update.message.reply_text(
-            f"Unsupported file type '{suffix or '(none)'}'. "
-            "Send a CSV, TSV or Excel (.xlsx/.xls) statement."
-        )
+    if suffix not in UPLOAD_EXTENSIONS:
+        results = [
+            f"Unsupported file type '{suffix or '(none)'}' ({filename}). "
+            "Send CSV, TSV, Excel (.xlsx/.xls) or a .zip of statements."
+        ]
+    else:
+        tg_file = await doc.get_file()
+        with tempfile.TemporaryDirectory() as tmp:
+            local = Path(tmp) / filename
+            await tg_file.download_to_drive(custom_path=str(local))
+            results = ingest_upload(get_store(context), chat_id, local, filename=filename)
+
+    group_id = update.message.media_group_id
+    if group_id is None:
+        # Single file (or a zip): reply immediately.
+        text = "\n\n".join(results)
+        if len(results) > 1:
+            text += f"\n\nProcessed {len(results)} file(s)."
+        text += "\n\nSend /report for the updated totals."
+        await _send_chunked(context.bot, chat_id, text)
         return
 
-    tg_file = await doc.get_file()
-    with tempfile.TemporaryDirectory() as tmp:
-        local = Path(tmp) / filename
-        await tg_file.download_to_drive(custom_path=str(local))
-        store = get_store(context)
-        try:
-            summary = ingest_file(store, chat_id, local, filename=filename)
-        except DuplicateFileError as e:
-            await update.message.reply_text(
-                f"Duplicate file skipped: identical content was already ingested as "
-                f"'{e.existing_filename}' ({e.uploaded_at}). Nothing was double-counted."
-            )
-            return
-        except ValueError as e:
-            await update.message.reply_text(f"Could not read {filename}: {e}")
-            return
-        except Exception:
-            log.exception("Failed to ingest %s", filename)
-            await update.message.reply_text(
-                f"Something went wrong reading {filename}. "
-                "Check that it is a valid statement export."
-            )
-            return
-
-    await update.message.reply_text(
-        summary_text(summary) + "\n\nSend /report for the updated totals."
+    # Part of an album (multiple files sent together): each file arrives as its
+    # own message with the same media_group_id and no end marker, so buffer the
+    # results and reply once after a short quiet period.
+    batches = context.chat_data.setdefault("upload_batches", {})
+    entry = batches.setdefault(group_id, {"lines": [], "count": 0, "task": None})
+    entry["lines"].extend(results)
+    entry["count"] += len(results)
+    if entry["task"] is not None:
+        entry["task"].cancel()
+    entry["task"] = context.application.create_task(
+        _flush_batch(context, chat_id, group_id), update=update
     )
 
 

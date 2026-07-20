@@ -24,6 +24,10 @@ It does not value the catalog or apply a multiple.
 
 ## What it does
 
+- **Bulk uploads.** Send one file, several files in a single message (Telegram
+  album — the bot replies once with a combined summary), or a `.zip` containing
+  any number of statements. Files inside a zip are ingested individually and
+  traced as `archive.zip/statement.csv`.
 - **Reads bulk files with different layouts.** Column names are mapped through an
   alias table (`Net Amount`, `Earnings (USD)`, `Royalty`, `Amount Payable`, ... all
   become the amount; `Sale Month`, `Distribution Period`, `Statement Date`, `Q1 2025`,
@@ -73,7 +77,7 @@ Each Telegram chat has its own isolated catalog. Data is stored in SQLite
 
 | Command | Purpose |
 | --- | --- |
-| *(send a file)* | Ingest a statement (`.csv`, `.tsv`, `.txt`, `.xlsx`, `.xls`) |
+| *(send files)* | Ingest statements (`.csv`, `.tsv`, `.txt`, `.xlsx`, `.xls`, or a `.zip` of them); multiple files per message supported |
 | `/report` | LTM total, category breakdown, per-year earnings |
 | `/uncategorized` | List transactions needing manual review |
 | `/categorize <id> <category>` | Assign masters / publishing / producer / neighbouring / other |
