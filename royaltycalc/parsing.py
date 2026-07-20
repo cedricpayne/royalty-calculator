@@ -6,23 +6,31 @@ The parser:
   * parses flexible date/period formats (full dates, "2025-03", "Mar 2025", "Q1 2025"),
   * parses amounts with currency symbols, thousands separators and parentheses,
   * keeps every raw row so each transaction is traceable to its origin.
+
+Files are STREAMED: `StatementReader` yields rows lazily with bounded memory,
+so multi-hundred-megabyte statements ingest without loading into RAM. CSV/TSV
+go through the stdlib csv module; .xlsx/.xlsm through openpyxl in read-only
+mode; legacy .xls (small by nature) through pandas.
 """
 
 from __future__ import annotations
 
 import calendar
+import csv
 import hashlib
 import json
 import re
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal, InvalidOperation
+from functools import lru_cache
+from itertools import chain
 from pathlib import Path
+from typing import Iterator
 
-import pandas as pd
 from dateutil import parser as dateutil_parser
 
-from .categorize import categorize_row
+from .categorize import UNCATEGORIZED, categorize_row
 
 # ---------------------------------------------------------------------------
 # Column alias table
@@ -94,6 +102,7 @@ _CURRENCY_SYMBOLS = {"$": "USD", "€": "EUR", "£": "GBP", "¥": "JPY"}
 _AMOUNT_CLEAN_RE = re.compile(r"[^\d.,\-()]")
 
 
+@lru_cache(maxsize=65536)  # statement cells repeat heavily; caching is a big win
 def parse_amount(raw: str | float | int | None) -> Decimal | None:
     """Parse '$1,234.56', '(12.50)', '1.234,56', '0.003' etc. into a Decimal."""
     if raw is None:
@@ -156,6 +165,7 @@ def _end_of_month(year: int, month: int) -> date:
     return date(year, month, calendar.monthrange(year, month)[1])
 
 
+@lru_cache(maxsize=16384)  # dates/periods repeat across a statement's rows
 def parse_statement_date(raw: str | None) -> date | None:
     """Parse a transaction date or statement period into a date.
 
@@ -215,7 +225,7 @@ def parse_statement_date(raw: str | None) -> date | None:
 
 
 # ---------------------------------------------------------------------------
-# File reading
+# File reading (streaming)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -257,29 +267,58 @@ class ParseResult:
 
 _TOTAL_ROW_RE = re.compile(r"(?i)^\s*(grand\s+)?(sub)?total\b")
 
+MAX_SKIPPED_SAMPLES = 200   # keep at most this many skip reasons in memory
 
-def _read_table(path: Path) -> pd.DataFrame:
+
+def _cell_to_str(v) -> str:
+    if v is None:
+        return ""
+    s = str(v).strip()
+    return "" if s.lower() == "nan" else s
+
+
+def _iter_raw_rows(path: Path) -> Iterator[list[str]]:
+    """Yield each row of the file as a list of stripped cell strings, lazily."""
     suffix = path.suffix.lower()
-    if suffix in {".xlsx", ".xlsm", ".xls"}:
-        return pd.read_excel(path, header=None, dtype=str)
-    # CSV/TSV/TXT: sniff the delimiter.
-    return pd.read_csv(
-        path, header=None, dtype=str, sep=None, engine="python",
-        skip_blank_lines=False, encoding_errors="replace",
-    )
+    if suffix in {".xlsx", ".xlsm"}:
+        from openpyxl import load_workbook
+
+        wb = load_workbook(path, read_only=True, data_only=True)
+        try:
+            for row in wb.worksheets[0].iter_rows(values_only=True):
+                yield [_cell_to_str(c) for c in row]
+        finally:
+            wb.close()
+    elif suffix == ".xls":
+        # Legacy format with a hard 65k-row cap - small enough to load whole.
+        import pandas as pd
+
+        df = pd.read_excel(path, header=None, dtype=str)
+        for _, row in df.iterrows():
+            yield ["" if pd.isna(c) else _cell_to_str(c) for c in row]
+    else:
+        with open(path, newline="", encoding="utf-8-sig", errors="replace") as fh:
+            sample = fh.read(64 * 1024)
+            fh.seek(0)
+            try:
+                delimiter = csv.Sniffer().sniff(sample, delimiters=",;\t|").delimiter
+            except csv.Error:
+                delimiter = ","
+            for row in csv.reader(fh, delimiter=delimiter):
+                yield [c.strip() for c in row]
 
 
-def _find_header_row(df: pd.DataFrame, max_scan: int = 15) -> tuple[int, dict[int, tuple[str, int]]]:
-    """Locate the header row: the first row where >=2 cells map to known fields
+def _scan_for_header(rows: list[list[str]]) -> tuple[int, dict[int, tuple[str, int]]]:
+    """Locate the header row: the first row where cells map to known fields
     (at minimum an amount column). Returns (row_index, {col_index: (field, rank)}).
     """
     best: tuple[int, dict[int, tuple[str, int]]] | None = None
-    for i in range(min(max_scan, len(df))):
+    for i, cells in enumerate(rows):
         mapping: dict[int, tuple[str, int]] = {}
-        for col_idx, cell in enumerate(df.iloc[i]):
-            if pd.isna(cell):
+        for col_idx, cell in enumerate(cells):
+            if not cell:
                 continue
-            hit = _ALIAS_LOOKUP.get(_norm_header(str(cell)))
+            hit = _ALIAS_LOOKUP.get(_norm_header(cell))
             if hit:
                 mapping[col_idx] = hit
         fields_found = {f for f, _ in mapping.values()}
@@ -295,96 +334,111 @@ def _find_header_row(df: pd.DataFrame, max_scan: int = 15) -> tuple[int, dict[in
     )
 
 
-def parse_file(path: str | Path, filename: str | None = None) -> ParseResult:
-    """Parse a statement file into normalized transaction rows."""
-    path = Path(path)
-    filename = filename or path.name
-    df = _read_table(path)
-    header_idx, col_hits = _find_header_row(df)
+class StatementReader:
+    """Streams normalized transaction rows from one statement file.
 
-    headers = [("" if pd.isna(c) else str(c).strip()) for c in df.iloc[header_idx]]
+    Construction reads only the first few rows (header detection); iterating
+    parses the rest lazily, so memory stays bounded for arbitrarily large
+    files. Bookkeeping (skip counts, currencies seen) accumulates during
+    iteration; call `finalize_warnings()` after consuming the iterator.
+    """
 
-    # Choose the best column for each canonical field (lowest alias rank wins).
-    chosen: dict[str, int] = {}
-    chosen_rank: dict[str, int] = {}
-    for col_idx, (field_name, rank) in col_hits.items():
-        if field_name not in chosen or rank < chosen_rank[field_name]:
-            chosen[field_name] = col_idx
-            chosen_rank[field_name] = rank
+    HEADER_SCAN_ROWS = 15
 
-    if "amount" not in chosen:
-        raise ValueError("No amount column recognized in this file.")
+    def __init__(self, path: str | Path, filename: str | None = None):
+        self.path = Path(path)
+        self.filename = filename or self.path.name
+        self.skipped_count = 0
+        self.skipped_samples: list[tuple[int, str]] = []
+        self.currencies: set[str] = set()
+        self.warnings: list[str] = []
 
-    column_map = {f: headers[idx] for f, idx in chosen.items()}
-    warnings: list[str] = []
-    if "date" not in chosen:
-        warnings.append(
-            "No date/period column recognized - rows will need manual review."
-        )
+        self._raw_iter = _iter_raw_rows(self.path)
+        buffered: list[list[str]] = []
+        for row in self._raw_iter:
+            buffered.append(row)
+            if len(buffered) >= self.HEADER_SCAN_ROWS:
+                break
+        header_idx, col_hits = _scan_for_header(buffered)
+        headers = buffered[header_idx]
 
-    header_currency = detect_currency(None, headers[chosen["amount"]])
+        chosen: dict[str, int] = {}
+        chosen_rank: dict[str, int] = {}
+        for col_idx, (field_name, rank) in col_hits.items():
+            if field_name not in chosen or rank < chosen_rank[field_name]:
+                chosen[field_name] = col_idx
+                chosen_rank[field_name] = rank
+        if "amount" not in chosen:
+            raise ValueError("No amount column recognized in this file.")
 
-    def cell(row, field_name: str) -> str | None:
-        idx = chosen.get(field_name)
-        if idx is None:
+        self._headers = headers
+        self._chosen = chosen
+        self._header_idx = header_idx
+        self._pending = buffered[header_idx + 1:]
+        self._header_currency = detect_currency(None, headers[chosen["amount"]])
+        self.column_map = {f: headers[idx] for f, idx in chosen.items()}
+        if "date" not in chosen:
+            self.warnings.append(
+                "No date/period column recognized - rows will need manual review."
+            )
+
+    def _cell(self, cells: list[str], field_name: str) -> str | None:
+        idx = self._chosen.get(field_name)
+        if idx is None or idx >= len(cells):
             return None
-        v = row.iloc[idx]
-        if pd.isna(v):
-            return None
-        v = str(v).strip()
-        return v or None
+        return cells[idx] or None
 
-    rows: list[ParsedRow] = []
-    skipped: list[tuple[int, str]] = []
+    def _skip(self, row_number: int, reason: str) -> None:
+        self.skipped_count += 1
+        if len(self.skipped_samples) < MAX_SKIPPED_SAMPLES:
+            self.skipped_samples.append((row_number, reason))
 
-    for data_i in range(header_idx + 1, len(df)):
-        row = df.iloc[data_i]
-        row_number = data_i + 1  # 1-based position in the original file
-        raw = {
-            headers[j] or f"col{j+1}": ("" if pd.isna(row.iloc[j]) else str(row.iloc[j]).strip())
-            for j in range(len(headers))
-        }
-        if all(v == "" for v in raw.values()):
-            continue
+    def __iter__(self) -> Iterator[ParsedRow]:
+        headers = self._headers
+        for offset, cells in enumerate(chain(self._pending, self._raw_iter)):
+            row_number = self._header_idx + 2 + offset  # 1-based position in file
+            raw: dict[str, str] = {}
+            for j in range(max(len(headers), len(cells))):
+                key = (headers[j] if j < len(headers) and headers[j] else f"col{j+1}")
+                raw[key] = cells[j] if j < len(cells) else ""
+            if all(v == "" for v in raw.values()):
+                continue
 
-        first_cell = next((v for v in raw.values() if v), "")
-        amount = parse_amount(cell(row, "amount"))
-        if amount is None:
-            skipped.append((row_number, "no parseable amount"))
-            continue
-        if _TOTAL_ROW_RE.match(first_cell) or any(
-            _TOTAL_ROW_RE.match(v) for v in raw.values() if v
-        ):
-            skipped.append((row_number, "looks like a total/subtotal row"))
-            continue
+            first_cell = next((v for v in raw.values() if v), "")
+            amount = parse_amount(self._cell(cells, "amount"))
+            if amount is None:
+                self._skip(row_number, "no parseable amount")
+                continue
+            if _TOTAL_ROW_RE.match(first_cell) or any(
+                _TOTAL_ROW_RE.match(v) for v in raw.values() if v
+            ):
+                self._skip(row_number, "looks like a total/subtotal row")
+                continue
 
-        txn_date = parse_statement_date(cell(row, "date"))
-        income_type = cell(row, "income_type")
-        source = cell(row, "source")
-        track = cell(row, "track")
-        artist = cell(row, "artist")
-        description = cell(row, "description")
-        currency = (
-            cell(row, "currency")
-            or detect_currency(cell(row, "amount"), None)
-            or header_currency
-        )
-        if currency:
-            currency = currency.upper()
+            txn_date = parse_statement_date(self._cell(cells, "date"))
+            income_type = self._cell(cells, "income_type")
+            source = self._cell(cells, "source")
+            description = self._cell(cells, "description")
+            currency = (
+                self._cell(cells, "currency")
+                or detect_currency(self._cell(cells, "amount"), None)
+                or self._header_currency
+            )
+            if currency:
+                currency = currency.upper()
+                self.currencies.add(currency)
 
-        category, reason = categorize_row(income_type, source, description, filename)
-        if txn_date is None:
-            # Without a date the transaction cannot be placed in a year or the
-            # LTM window, so force manual review regardless of keyword matches.
-            from .categorize import UNCATEGORIZED
-            if category != UNCATEGORIZED:
-                reason = f"date missing/unparseable (would be {category}: {reason})"
-            else:
-                reason = "date missing/unparseable; " + reason
-            category = UNCATEGORIZED
+            category, reason = categorize_row(income_type, source, description, self.filename)
+            if txn_date is None:
+                # Without a date the transaction cannot be placed in a year or
+                # the LTM window, so force manual review regardless of keywords.
+                if category != UNCATEGORIZED:
+                    reason = f"date missing/unparseable (would be {category}: {reason})"
+                else:
+                    reason = "date missing/unparseable; " + reason
+                category = UNCATEGORIZED
 
-        rows.append(
-            ParsedRow(
+            yield ParsedRow(
                 row_number=row_number,
                 txn_date=txn_date,
                 amount=amount,
@@ -393,21 +447,37 @@ def parse_file(path: str | Path, filename: str | None = None) -> ParseResult:
                 category_reason=reason,
                 income_type=income_type,
                 source=source,
-                track=track,
-                artist=artist,
+                track=self._cell(cells, "track"),
+                artist=self._cell(cells, "artist"),
                 description=description,
                 raw=raw,
             )
-        )
 
-    currencies = {r.currency for r in rows if r.currency}
-    if len(currencies) > 1:
-        warnings.append(
-            "Multiple currencies detected in this file: "
-            + ", ".join(sorted(currencies))
-            + ". Totals do not convert between currencies."
-        )
-    return ParseResult(rows=rows, skipped=skipped, column_map=column_map, warnings=warnings)
+    def finalize_warnings(self) -> list[str]:
+        """Warnings including those only known after full iteration."""
+        if len(self.currencies) > 1:
+            note = (
+                "Multiple currencies detected in this file: "
+                + ", ".join(sorted(self.currencies))
+                + ". Totals do not convert between currencies."
+            )
+            if note not in self.warnings:
+                self.warnings.append(note)
+        return self.warnings
+
+
+def parse_file(path: str | Path, filename: str | None = None) -> ParseResult:
+    """Parse a whole statement into memory. Convenience wrapper around
+    StatementReader for small files and tests; large-file ingestion streams
+    the reader directly instead."""
+    reader = StatementReader(path, filename=filename)
+    rows = list(reader)
+    return ParseResult(
+        rows=rows,
+        skipped=list(reader.skipped_samples),
+        column_map=dict(reader.column_map),
+        warnings=reader.finalize_warnings(),
+    )
 
 
 def file_sha256(path: str | Path) -> str:

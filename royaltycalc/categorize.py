@@ -12,6 +12,7 @@ Categories:
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 
 MASTERS = "Masters"
 PUBLISHING = "Publishing"
@@ -102,6 +103,7 @@ def categorize_text(text: str) -> tuple[str, str | None]:
     return UNCATEGORIZED, None
 
 
+@lru_cache(maxsize=65536)  # the same type/source strings repeat across rows
 def categorize_row(
     income_type: str | None,
     source: str | None,

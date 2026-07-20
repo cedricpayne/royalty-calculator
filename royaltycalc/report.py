@@ -1,4 +1,8 @@
-"""Build the earnings report: LTM total, category breakdown, per-year totals."""
+"""Build the earnings report: LTM total, category breakdown, per-year totals.
+
+All aggregation runs as SQL against the store, so reports stay fast and
+memory-flat even with millions of ingested transactions.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +13,7 @@ from decimal import Decimal
 from dateutil.relativedelta import relativedelta
 
 from .categorize import MASTERS, NEIGHBOURING, OTHER, PRODUCER, PUBLISHING, UNCATEGORIZED
+from .store import Store, from_micros
 
 MAIN_CATEGORIES = [MASTERS, PUBLISHING, PRODUCER, NEIGHBOURING, OTHER]
 
@@ -28,41 +33,60 @@ class Report:
     txn_count: int = 0
 
 
-def build_report(rows, as_of: date | None = None) -> Report:
-    """Aggregate transaction rows (sqlite Rows or dicts).
+def build_report(store: Store, chat_id: str | int, as_of: date | None = None) -> Report:
+    """Aggregate a chat's non-duplicate transactions.
 
     LTM = the trailing 12 months ending on `as_of` (default: today), i.e.
     transactions dated after (as_of - 12 months) up to and including as_of.
-    Category totals are all-time. Duplicate rows must already be filtered out.
+    Category totals are all-time.
     """
     as_of = as_of or date.today()
     ltm_start = as_of - relativedelta(months=12)
     rep = Report(as_of=as_of, ltm_start=ltm_start)
     rep.by_category = {c: Decimal("0") for c in MAIN_CATEGORIES}
 
-    for row in rows:
-        amount = Decimal(str(row["amount"]))
-        category = row["category"]
-        txn_date = date.fromisoformat(row["txn_date"]) if row["txn_date"] else None
+    chat = str(chat_id)
+    conn = store.conn
+    base = "FROM transactions WHERE chat_id=? AND is_duplicate=0"
 
-        rep.txn_count += 1
-        rep.total += amount
-        if row["currency"]:
-            rep.currencies.add(row["currency"])
+    row = conn.execute(
+        f"SELECT COUNT(*) AS n, COALESCE(SUM(amount_micros),0) AS t, "
+        f"COUNT(*) FILTER (WHERE txn_date IS NULL) AS undated {base}",
+        (chat,),
+    ).fetchone()
+    rep.txn_count = row["n"]
+    rep.total = from_micros(row["t"])
+    rep.undated_count = row["undated"]
 
-        if category == UNCATEGORIZED:
-            rep.uncategorized_total += amount
-            rep.uncategorized_count += 1
+    for r in conn.execute(
+        f"SELECT category, COALESCE(SUM(amount_micros),0) AS t, COUNT(*) AS n "
+        f"{base} GROUP BY category",
+        (chat,),
+    ):
+        if r["category"] == UNCATEGORIZED:
+            rep.uncategorized_total = from_micros(r["t"])
+            rep.uncategorized_count = r["n"]
         else:
-            rep.by_category[category] = rep.by_category.get(category, Decimal("0")) + amount
+            rep.by_category[r["category"]] = from_micros(r["t"])
 
-        if txn_date is None:
-            rep.undated_count += 1
-            continue
-        year = txn_date.year
-        rep.by_year[year] = rep.by_year.get(year, Decimal("0")) + amount
-        if ltm_start < txn_date <= as_of:
-            rep.ltm_total += amount
+    for r in conn.execute(
+        f"SELECT year, COALESCE(SUM(amount_micros),0) AS t "
+        f"{base} AND year IS NOT NULL GROUP BY year",
+        (chat,),
+    ):
+        rep.by_year[int(r["year"])] = from_micros(r["t"])
+
+    ltm = conn.execute(
+        f"SELECT COALESCE(SUM(amount_micros),0) AS t {base} "
+        f"AND txn_date IS NOT NULL AND txn_date > ? AND txn_date <= ?",
+        (chat, ltm_start.isoformat(), as_of.isoformat()),
+    ).fetchone()
+    rep.ltm_total = from_micros(ltm["t"])
+
+    for r in conn.execute(
+        f"SELECT DISTINCT currency {base} AND currency IS NOT NULL", (chat,)
+    ):
+        rep.currencies.add(r["currency"])
 
     return rep
 

@@ -116,6 +116,33 @@ Notes:
 - Pushes to your default branch auto-deploy; the volume keeps your data across
   deploys.
 
+## Large catalogs (hundreds of MB of statements)
+
+The pipeline is built for bulk: files stream from disk row-by-row (constant
+~30 MB of memory regardless of file size), inserts are batched, and duplicate
+detection and reporting run inside SQLite. Measured throughput is roughly
+20,000 rows/second — a 750 MB catalog (~13M rows) ingests in about 10-15
+minutes, and the bot stays responsive while it works.
+
+**Getting big files into Telegram.** Telegram limits what a bot can *download*
+to 20 MB per file. Three ways around it:
+
+1. **Zip and split** — CSVs compress ~10x, so 750 MB of statements is usually
+   4-8 zips under 20 MB. Send them all in one message; the bot processes each
+   archive's contents individually.
+2. **`/fetch <url>`** — put the file (or one big zip) anywhere with a direct
+   download link (Dropbox `?dl=1`, Google Drive direct link, an S3 presigned
+   URL) and the bot downloads it itself. Default cap 1 GB, configurable with
+   `ROYALTY_MAX_FETCH_MB`.
+3. **Self-hosted Bot API server** (advanced) — run
+   [telegram-bot-api](https://github.com/tdlib/telegram-bot-api) alongside the
+   bot and set `TELEGRAM_API_BASE_URL` / `TELEGRAM_API_BASE_FILE_URL`; the
+   download limit rises to 2 GB per file.
+
+**Volume sizing.** The database keeps the full raw row for every transaction
+(that's what makes every number traceable), which costs roughly 8-10x the
+input CSV size. For a 750 MB catalog, size the Railway volume at ~10 GB.
+
 ## CLI (same engine, no Telegram needed)
 
 ```bash

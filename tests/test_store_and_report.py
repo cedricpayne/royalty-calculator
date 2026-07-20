@@ -80,7 +80,7 @@ def test_full_report(store):
     ):
         ingest_file(store, CHAT, SAMPLES / name)
 
-    rep = build_report(store.transactions(CHAT), as_of=date(2026, 7, 20))
+    rep = build_report(store, CHAT, as_of=date(2026, 7, 20))
 
     # Category totals (all-time)
     assert rep.by_category["Masters"] == Decimal("42.18") + Decimal("18.94") + \
@@ -131,7 +131,7 @@ def test_manual_categorize_updates_report(store):
     assert len(unc) == 1
     store.set_category(CHAT, unc[0]["id"], "Publishing")
     assert store.uncategorized(CHAT) == []
-    rep = build_report(store.transactions(CHAT), as_of=date(2026, 7, 20))
+    rep = build_report(store, CHAT, as_of=date(2026, 7, 20))
     assert rep.uncategorized_count == 0
     assert rep.by_category["Publishing"] == Decimal("75.25") + Decimal("99.99")
 

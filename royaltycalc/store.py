@@ -4,27 +4,33 @@ Every transaction keeps: the file it came from, its row number in that file,
 the full raw row (JSON) and the reason it was categorized the way it was -
 so every reported number is traceable back to its origin.
 
+Built for bulk: rows stream from the parser and are inserted in batches, so
+memory stays flat for very large statements. Amounts are stored both as exact
+decimal text (source of truth for display/trace) and as integer micro-units
+(`amount_micros`) so totals and duplicate math run inside SQLite instead of
+Python.
+
 Duplicate handling:
   * whole-file duplicates: rejected by content hash (SHA-256), regardless of filename;
   * transaction duplicates: when a newly uploaded file contains rows whose raw
     content is identical to rows already ingested from *other* files, those rows
     are stored but flagged `is_duplicate=1` and excluded from all totals.
-    Matching is occurrence-aware: if an earlier file legitimately contains the
-    same line twice and the new file has it three times, only two are considered
-    already-counted... (min of the two counts is preserved as non-duplicate).
+    Matching is occurrence-aware (done with a window function in SQL): if an
+    earlier file legitimately contains the same line twice and the new file has
+    it three times, two are flagged and one still counts.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
-from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
+from typing import Iterable
 
-from .parsing import ParseResult, ParsedRow
+from .parsing import ParsedRow, StatementReader
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
@@ -48,6 +54,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     txn_date TEXT,
     year INTEGER,
     amount TEXT NOT NULL,
+    amount_micros INTEGER NOT NULL DEFAULT 0,
     currency TEXT,
     category TEXT NOT NULL,
     category_reason TEXT,
@@ -66,7 +73,21 @@ CREATE TABLE IF NOT EXISTS transactions (
 CREATE INDEX IF NOT EXISTS idx_txn_chat ON transactions (chat_id, is_duplicate);
 CREATE INDEX IF NOT EXISTS idx_txn_fingerprint ON transactions (chat_id, fingerprint);
 CREATE INDEX IF NOT EXISTS idx_txn_year ON transactions (chat_id, year);
+CREATE INDEX IF NOT EXISTS idx_txn_file ON transactions (file_id);
 """
+
+INSERT_BATCH_SIZE = 2000
+COMMIT_EVERY_ROWS = 100_000   # fsync cadence during bulk ingest
+
+
+def to_micros(amount: Decimal) -> int:
+    """Exact-integer representation at 6 decimal places (streaming royalties
+    routinely carry sub-cent amounts)."""
+    return int(amount.scaleb(6).to_integral_value(rounding=ROUND_HALF_UP))
+
+
+def from_micros(micros: int | None) -> Decimal:
+    return Decimal(micros or 0).scaleb(-6)
 
 
 class DuplicateFileError(Exception):
@@ -96,10 +117,27 @@ class Store:
         db_path = Path(db_path)
         if db_path.parent and str(db_path.parent) not in ("", "."):
             db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(db_path))
+        # check_same_thread=False lets ingestion run on a worker thread while
+        # quick queries stay on the event loop; callers serialize writes.
+        self.conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
+        self.conn.execute("PRAGMA journal_mode = WAL")
+        self.conn.execute("PRAGMA synchronous = NORMAL")
         self.conn.executescript(_SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(transactions)")}
+        if cols and "amount_micros" not in cols:
+            self.conn.execute(
+                "ALTER TABLE transactions ADD COLUMN amount_micros INTEGER NOT NULL DEFAULT 0"
+            )
+            self.conn.execute(
+                "UPDATE transactions SET amount_micros = "
+                "CAST(ROUND(CAST(amount AS REAL) * 1000000) AS INTEGER)"
+            )
+            self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
@@ -111,91 +149,141 @@ class Store:
         chat_id: str | int,
         filename: str,
         sha256: str,
-        result: ParseResult,
+        reader: StatementReader | Iterable[ParsedRow],
     ) -> IngestSummary:
+        """Stream rows from `reader` into the database.
+
+        The reader is consumed once, in batches; duplicate marking and all
+        counting happen in SQL afterwards, so ingestion memory is flat no
+        matter how large the statement is.
+        """
         chat_id = str(chat_id)
-        cur = self.conn.execute(
+        existing = self.conn.execute(
             "SELECT filename, uploaded_at FROM files WHERE chat_id=? AND sha256=?",
             (chat_id, sha256),
-        )
-        existing = cur.fetchone()
+        ).fetchone()
         if existing:
             raise DuplicateFileError(existing["filename"], existing["uploaded_at"])
 
-        # Occurrence counts of each fingerprint already ingested (non-duplicate)
-        # in this chat, so duplicate detection is multiset-aware.
-        existing_counts: Counter[str] = Counter()
-        first_seen: dict[str, int] = {}
-        for row in self.conn.execute(
-            "SELECT fingerprint, MIN(id) AS first_id, COUNT(*) AS n FROM transactions "
-            "WHERE chat_id=? AND is_duplicate=0 GROUP BY fingerprint",
-            (chat_id,),
-        ):
-            existing_counts[row["fingerprint"]] = row["n"]
-            first_seen[row["fingerprint"]] = row["first_id"]
-
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        column_map = getattr(reader, "column_map", None)
         cur = self.conn.execute(
             "INSERT INTO files (chat_id, filename, sha256, uploaded_at, column_map) "
             "VALUES (?,?,?,?,?)",
-            (chat_id, filename, sha256, now, json.dumps(result.column_map)),
+            (chat_id, filename, sha256, now, json.dumps(column_map or {})),
         )
         file_id = cur.lastrowid
-
-        ingested = duplicates = uncategorized = 0
-        total_added = Decimal("0")
-        for r in result.rows:
-            fp = r.fingerprint
-            is_dup = 0
-            dup_of = None
-            if existing_counts.get(fp, 0) > 0:
-                existing_counts[fp] -= 1
-                is_dup = 1
-                dup_of = first_seen.get(fp)
-            self._insert_txn(chat_id, file_id, r, is_dup, dup_of)
-            if is_dup:
-                duplicates += 1
-            else:
-                ingested += 1
-                total_added += r.amount
-                if r.category == "Uncategorized":
-                    uncategorized += 1
-
-        self.conn.execute(
-            "UPDATE files SET rows_ingested=?, rows_duplicate=?, rows_skipped=? WHERE id=?",
-            (ingested, duplicates, len(result.skipped), file_id),
-        )
         self.conn.commit()
+
+        try:
+            batch: list[tuple] = []
+            since_commit = 0
+            for r in reader:
+                batch.append(self._txn_tuple(chat_id, file_id, r))
+                if len(batch) >= INSERT_BATCH_SIZE:
+                    self._flush(batch)
+                    since_commit += len(batch)
+                    batch = []
+                    if since_commit >= COMMIT_EVERY_ROWS:
+                        self.conn.commit()
+                        since_commit = 0
+            if batch:
+                self._flush(batch)
+            self.conn.commit()
+
+            self._mark_duplicates(chat_id, file_id)
+
+            counts = self.conn.execute(
+                "SELECT "
+                "COUNT(*) FILTER (WHERE is_duplicate=0) AS ingested, "
+                "COUNT(*) FILTER (WHERE is_duplicate=1) AS dups, "
+                "COALESCE(SUM(amount_micros) FILTER (WHERE is_duplicate=0), 0) AS total, "
+                "COUNT(*) FILTER (WHERE is_duplicate=0 AND category='Uncategorized') AS unc "
+                "FROM transactions WHERE file_id=?",
+                (file_id,),
+            ).fetchone()
+
+            skipped_count = getattr(reader, "skipped_count", 0)
+            self.conn.execute(
+                "UPDATE files SET rows_ingested=?, rows_duplicate=?, rows_skipped=? WHERE id=?",
+                (counts["ingested"], counts["dups"], skipped_count, file_id),
+            )
+            self.conn.commit()
+        except Exception:
+            # Remove the partial file (transactions cascade) so a failed upload
+            # never leaves half-counted income behind.
+            self.conn.rollback()
+            self.conn.execute("DELETE FROM files WHERE id=?", (file_id,))
+            self.conn.commit()
+            raise
+
+        finalize = getattr(reader, "finalize_warnings", None)
+        warnings = finalize() if callable(finalize) else []
         return IngestSummary(
             file_id=file_id,
             filename=filename,
-            rows_ingested=ingested,
-            rows_duplicate=duplicates,
-            rows_skipped=len(result.skipped),
-            uncategorized=uncategorized,
-            total_added=total_added,
-            warnings=list(result.warnings),
-            skipped_details=list(result.skipped),
+            rows_ingested=counts["ingested"],
+            rows_duplicate=counts["dups"],
+            rows_skipped=getattr(reader, "skipped_count", 0),
+            uncategorized=counts["unc"],
+            total_added=from_micros(counts["total"]),
+            warnings=list(warnings),
+            skipped_details=list(getattr(reader, "skipped_samples", [])),
         )
 
-    def _insert_txn(
-        self, chat_id: str, file_id: int, r: ParsedRow, is_dup: int, dup_of: int | None
-    ) -> None:
-        self.conn.execute(
-            "INSERT INTO transactions (chat_id, file_id, row_number, txn_date, year, "
-            "amount, currency, category, category_reason, income_type, source, track, "
-            "artist, description, fingerprint, is_duplicate, duplicate_of, raw_json) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                chat_id, file_id, r.row_number,
-                r.txn_date.isoformat() if r.txn_date else None,
-                r.txn_date.year if r.txn_date else None,
-                str(r.amount), r.currency, r.category, r.category_reason,
-                r.income_type, r.source, r.track, r.artist, r.description,
-                r.fingerprint, is_dup, dup_of,
-                json.dumps(r.raw, ensure_ascii=False),
-            ),
+    def _txn_tuple(self, chat_id: str, file_id: int, r: ParsedRow) -> tuple:
+        return (
+            chat_id, file_id, r.row_number,
+            r.txn_date.isoformat() if r.txn_date else None,
+            r.txn_date.year if r.txn_date else None,
+            str(r.amount), to_micros(r.amount), r.currency, r.category,
+            r.category_reason, r.income_type, r.source, r.track, r.artist,
+            r.description, r.fingerprint, json.dumps(r.raw, ensure_ascii=False),
         )
+
+    def _flush(self, batch: list[tuple]) -> None:
+        # No commit here: the caller batches commits (COMMIT_EVERY_ROWS) so a
+        # bulk ingest is not bound by fsync frequency.
+        self.conn.executemany(
+            "INSERT INTO transactions (chat_id, file_id, row_number, txn_date, year, "
+            "amount, amount_micros, currency, category, category_reason, income_type, "
+            "source, track, artist, description, fingerprint, raw_json) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            batch,
+        )
+
+    def _mark_duplicates(self, chat_id: str, file_id: int) -> None:
+        """Flag rows of `file_id` that repeat rows already ingested from other
+        files, occurrence-aware: with N prior copies of a fingerprint, only the
+        first N matching rows in this file are flagged."""
+        self.conn.execute(
+            """
+            WITH existing AS (
+                SELECT fingerprint, COUNT(*) AS n, MIN(id) AS first_id
+                FROM transactions
+                WHERE chat_id = :chat AND is_duplicate = 0 AND file_id <> :fid
+                GROUP BY fingerprint
+            ),
+            ranked AS (
+                SELECT id, fingerprint,
+                       ROW_NUMBER() OVER (PARTITION BY fingerprint ORDER BY id) AS rn
+                FROM transactions WHERE file_id = :fid
+            )
+            UPDATE transactions
+            SET is_duplicate = 1,
+                duplicate_of = (
+                    SELECT e.first_id FROM existing e
+                    WHERE e.fingerprint = transactions.fingerprint
+                )
+            WHERE id IN (
+                SELECT r.id FROM ranked r
+                JOIN existing e ON e.fingerprint = r.fingerprint
+                WHERE r.rn <= e.n
+            )
+            """,
+            {"chat": chat_id, "fid": file_id},
+        )
+        self.conn.commit()
 
     # ------------------------------------------------------------------ queries
 

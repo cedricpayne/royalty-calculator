@@ -52,9 +52,9 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as e:
                 print(f"Failed to ingest {f}: {e}", file=sys.stderr)
         print()
-        print(render_report(build_report(store.transactions(cid))))
+        print(render_report(build_report(store, cid)))
     elif args.cmd == "report":
-        print(render_report(build_report(store.transactions(cid))))
+        print(render_report(build_report(store, cid)))
     elif args.cmd == "uncategorized":
         rows = store.uncategorized(cid)
         if not rows:

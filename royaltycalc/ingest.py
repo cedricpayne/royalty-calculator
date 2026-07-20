@@ -8,7 +8,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-from .parsing import file_sha256, parse_file
+from .parsing import StatementReader, file_sha256
 from .store import DuplicateFileError, IngestSummary, Store
 
 log = logging.getLogger(__name__)
@@ -17,13 +17,16 @@ SUPPORTED_EXTENSIONS = {".csv", ".tsv", ".txt", ".xlsx", ".xlsm", ".xls"}
 ARCHIVE_EXTENSIONS = {".zip"}
 UPLOAD_EXTENSIONS = SUPPORTED_EXTENSIONS | ARCHIVE_EXTENSIONS
 
-# Safety limits for zip uploads.
-MAX_ZIP_MEMBERS = 200
-MAX_MEMBER_BYTES = 100 * 1024 * 1024
+# Safety limits for zip uploads. Members are extracted, ingested and deleted
+# one at a time, so disk usage peaks at one member, not the whole archive.
+MAX_ZIP_MEMBERS = 500
+MAX_MEMBER_BYTES = 1024 * 1024 * 1024        # 1 GB per statement
+MAX_TOTAL_EXTRACTED = 4 * 1024 * 1024 * 1024  # 4 GB per archive
 
 
 def ingest_file(store: Store, chat_id: str | int, path: str | Path,
                 filename: str | None = None) -> IngestSummary:
+    """Ingest a single statement, streaming rows straight into the store."""
     path = Path(path)
     filename = filename or path.name
     if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
@@ -32,39 +35,17 @@ def ingest_file(store: Store, chat_id: str | int, path: str | Path,
             f"Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
         )
     sha256 = file_sha256(path)
-    result = parse_file(path, filename=filename)
-    return store.ingest(chat_id, filename, sha256, result)
+    reader = StatementReader(path, filename=filename)
+    return store.ingest(chat_id, filename, sha256, reader)
 
 
-def _expand_zip(path: Path, dest: Path) -> list[tuple[Path, str]]:
-    """Extract supported statement files from a zip into `dest`.
-
-    Returns (extracted_path, display_name) pairs. Directories, hidden files,
-    macOS metadata and unsupported types are skipped.
-    """
-    out: list[tuple[Path, str]] = []
-    with zipfile.ZipFile(path) as zf:
-        for info in zf.infolist():
-            if info.is_dir():
-                continue
-            if info.filename.startswith("__MACOSX"):
-                continue
-            name = Path(info.filename).name
-            if not name or name.startswith("."):
-                continue
-            if Path(name).suffix.lower() not in SUPPORTED_EXTENSIONS:
-                continue
-            if info.file_size > MAX_MEMBER_BYTES:
-                log.warning("Skipping oversized zip member %s", info.filename)
-                continue
-            if len(out) >= MAX_ZIP_MEMBERS:
-                log.warning("Zip has more than %d members; extras skipped", MAX_ZIP_MEMBERS)
-                break
-            target = dest / f"{len(out)}_{name}"
-            with zf.open(info) as src, open(target, "wb") as dst:
-                shutil.copyfileobj(src, dst)
-            out.append((target, name))
-    return out
+def _is_statement_member(info: zipfile.ZipInfo) -> bool:
+    if info.is_dir() or info.filename.startswith("__MACOSX"):
+        return False
+    name = Path(info.filename).name
+    if not name or name.startswith("."):
+        return False
+    return Path(name).suffix.lower() in SUPPORTED_EXTENSIONS
 
 
 def _ingest_one_to_text(store: Store, chat_id: str | int, path: Path, filename: str) -> str:
@@ -92,22 +73,54 @@ def ingest_upload(store: Store, chat_id: str | int, path: str | Path,
     """
     path = Path(path)
     filename = filename or path.name
-    if path.suffix.lower() in ARCHIVE_EXTENSIONS:
-        with tempfile.TemporaryDirectory() as tmp:
-            try:
-                members = _expand_zip(path, Path(tmp))
-            except zipfile.BadZipFile:
-                return [f"{filename} is not a valid zip archive."]
-            if not members:
-                return [
-                    f"{filename}: no statement files found inside "
-                    f"(supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))})."
-                ]
+    if path.suffix.lower() not in ARCHIVE_EXTENSIONS:
+        return [_ingest_one_to_text(store, chat_id, path, filename)]
+
+    try:
+        zf = zipfile.ZipFile(path)
+    except zipfile.BadZipFile:
+        return [f"{filename} is not a valid zip archive."]
+
+    results: list[str] = []
+    with zf:
+        members = [i for i in zf.infolist() if _is_statement_member(i)]
+        if not members:
             return [
-                _ingest_one_to_text(store, chat_id, member_path, f"{filename}/{member_name}")
-                for member_path, member_name in members
+                f"{filename}: no statement files found inside "
+                f"(supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))})."
             ]
-    return [_ingest_one_to_text(store, chat_id, path, filename)]
+        if len(members) > MAX_ZIP_MEMBERS:
+            results.append(
+                f"Zip contains {len(members)} statements; processing the first "
+                f"{MAX_ZIP_MEMBERS}. Split the rest into another archive."
+            )
+            members = members[:MAX_ZIP_MEMBERS]
+
+        total_extracted = 0
+        with tempfile.TemporaryDirectory() as tmp:
+            for k, info in enumerate(members):
+                name = Path(info.filename).name
+                if info.file_size > MAX_MEMBER_BYTES:
+                    results.append(
+                        f"Skipped {name}: {info.file_size >> 20} MB uncompressed "
+                        f"exceeds the {MAX_MEMBER_BYTES >> 20} MB per-file limit."
+                    )
+                    continue
+                total_extracted += info.file_size
+                if total_extracted > MAX_TOTAL_EXTRACTED:
+                    results.append(
+                        f"Stopped at {name}: archive expands beyond "
+                        f"{MAX_TOTAL_EXTRACTED >> 30} GB. Split it into smaller archives."
+                    )
+                    break
+                target = Path(tmp) / f"{k}_{name}"
+                with zf.open(info) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                results.append(
+                    _ingest_one_to_text(store, chat_id, target, f"{filename}/{name}")
+                )
+                target.unlink(missing_ok=True)
+    return results
 
 
 def summary_text(s: IngestSummary) -> str:
