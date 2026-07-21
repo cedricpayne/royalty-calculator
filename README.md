@@ -79,6 +79,8 @@ Each Telegram chat has its own isolated catalog. Data is stored in SQLite
 | --- | --- |
 | *(send files)* | Ingest statements (`.csv`, `.tsv`, `.txt`, `.xlsx`, `.xls`, or a `.zip` of them); multiple files per message supported |
 | `/report` | LTM total, category breakdown, per-year earnings |
+| `/upload` | Private browser page for big uploads (no Telegram size limit) |
+| `/fetch <url>` | Ingest from a link — direct files or share pages (Hightail/Dropbox/Drive) |
 | `/uncategorized` | List transactions needing manual review |
 | `/categorize <id> <category>` | Assign masters / publishing / producer / neighbouring / other |
 | `/trace <id>` | Show source file, row number and raw data for a transaction |
@@ -125,12 +127,22 @@ detection and reporting run inside SQLite. Measured throughput is roughly
 minutes, and the bot stays responsive while it works.
 
 **Getting big files into Telegram.** Telegram limits what a bot can *download*
-to 20 MB per file. Three ways around it:
+to 20 MB per file. Ways around it, easiest first:
 
-1. **Zip and split** — CSVs compress ~10x, so 750 MB of statements is usually
+1. **`/upload` (recommended)** — the bot serves its own drag-and-drop upload
+   page. Send `/upload` in the chat to get a private link (expires after 2
+   hours, bound to your chat), open it in any browser, and drop in statements
+   or zips of any size — up to 2 GB per file, 100 files per upload. Results
+   arrive back in the Telegram chat as each file finishes.
+
+   *Railway setup (one-time):* the page needs a public domain. In the service:
+   **Settings → Networking → Generate Domain**. Railway then injects
+   `RAILWAY_PUBLIC_DOMAIN` and `PORT` automatically and it works on the next
+   deploy. On other hosts, set `PUBLIC_BASE_URL` (e.g. `https://mybot.example.com`).
+2. **Zip and split** — CSVs compress ~10x, so 750 MB of statements is usually
    4-8 zips under 20 MB. Send them all in one message; the bot processes each
    archive's contents individually.
-2. **`/fetch <url>`** — put the file (or one big zip) anywhere reachable by
+3. **`/fetch <url>`** — put the file (or one big zip) anywhere reachable by
    link and the bot downloads it itself. Direct links (S3 presigned URLs, raw
    file URLs) always work; share pages (Hightail Spaces, Dropbox, Drive) are
    resolved automatically — the bot scans the page for the real download link
@@ -140,7 +152,7 @@ to 20 MB per file. Three ways around it:
    pages that require a login or build their download links entirely in
    JavaScript can't be resolved — download locally and send the files, or use
    a direct link.
-3. **Self-hosted Bot API server** (advanced) — run
+4. **Self-hosted Bot API server** (advanced) — run
    [telegram-bot-api](https://github.com/tdlib/telegram-bot-api) alongside the
    bot and set `TELEGRAM_API_BASE_URL` / `TELEGRAM_API_BASE_FILE_URL`; the
    download limit rises to 2 GB per file.

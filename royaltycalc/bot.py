@@ -33,6 +33,7 @@ from .fetch import ShareResolveError, download_statement
 from .ingest import UPLOAD_EXTENSIONS, ingest_upload
 from .report import build_report, fmt_money, render_report
 from .store import Store
+from .webupload import UploadServer
 
 logging.basicConfig(
     format="%(asctime)s %(name)s %(levelname)s %(message)s", level=logging.INFO
@@ -51,6 +52,16 @@ MAX_TELEGRAM_FILE = (2000 if API_BASE_URL else 20) * 1024 * 1024
 MAX_FETCH_BYTES = int(os.environ.get("ROYALTY_MAX_FETCH_MB", "1024")) * 1024 * 1024
 LARGE_FILE_ACK_BYTES = 5 * 1024 * 1024
 
+# Browser upload page (/upload): served on PORT (Railway injects it when a
+# public domain exists). The link base comes from PUBLIC_BASE_URL, or
+# RAILWAY_PUBLIC_DOMAIN which Railway sets automatically with a domain.
+WEB_PORT = int(os.environ.get("PORT", "8080"))
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL") or (
+    f"https://{os.environ['RAILWAY_PUBLIC_DOMAIN']}"
+    if os.environ.get("RAILWAY_PUBLIC_DOMAIN")
+    else None
+)
+
 HELP_TEXT = """\
 Music Catalog Earnings Bot
 
@@ -60,13 +71,14 @@ a .zip containing any number of statements. I combine them - even with \
 different column names - skip duplicate files/transactions, and report your \
 earnings.
 
-For large catalogs, zip your statements (CSVs compress ~10x). Telegram limits \
-bot downloads to 20 MB per file, so split big collections into several zips - \
-or use /fetch with a direct download link (Dropbox/Drive/S3), which has no \
-20 MB limit.
+Telegram caps files sent in chat at 20 MB. For anything bigger, send /upload \
+to get a private browser page where you can drag in files of any size - no \
+zipping or splitting needed. /fetch <link> also works for files hosted \
+elsewhere.
 
 Commands:
 /report - LTM total, category breakdown and per-year earnings
+/upload - get a private browser page for big uploads (no size limit)
 /fetch <url> - ingest from a link (direct file links and share pages like Hightail/Dropbox/Drive)
 /uncategorized - transactions needing manual review
 /categorize <id> <category> - assign a category (masters, publishing, producer, neighbouring, other)
@@ -150,14 +162,22 @@ def _too_big_message(filename: str, size: int) -> str:
             f"{filename} is {mb:,.0f} MB, above the 2 GB local Bot API limit. "
             "Split it into smaller archives."
         )
+    options = []
+    if PUBLIC_BASE_URL:
+        options.append(
+            "1) Send /upload - you'll get a private browser page where you can "
+            "drag this file in as-is, no size limit;"
+        )
+    options.append(
+        f"{len(options)+1}) Put the file anywhere with a download link "
+        "(Dropbox, Drive, S3, Hightail) and send /fetch <link>;"
+    )
+    options.append(
+        f"{len(options)+1}) Zip/split into archives under 20 MB and send them here."
+    )
     return (
         f"{filename} is {mb:,.0f} MB, but Telegram only lets bots download files "
-        "up to 20 MB. Options:\n"
-        "1) Zip your CSVs (they compress ~10x) and split into archives under 20 MB - "
-        "you can send several zips in one message;\n"
-        "2) Put the file anywhere with a direct download link (Dropbox, Drive, S3) "
-        "and send /fetch <link> - no 20 MB limit;\n"
-        "3) Self-host a Telegram Bot API server for a 2 GB limit (see README)."
+        "up to 20 MB in chat. Options:\n" + "\n".join(options)
     )
 
 
@@ -261,6 +281,26 @@ async def cmd_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         text += f"\n\nProcessed {len(results)} file(s)."
     text += "\n\nSend /report for the updated totals."
     await _send_chunked(context.bot, chat_id, text)
+
+
+async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    server: UploadServer | None = context.application.bot_data.get("upload_server")
+    if server is None or not PUBLIC_BASE_URL:
+        await update.message.reply_text(
+            "The browser upload page needs a public domain.\n"
+            "On Railway: open the service, Settings -> Networking -> Generate "
+            "Domain, then redeploy. (Railway sets RAILWAY_PUBLIC_DOMAIN "
+            "automatically; on other hosts set PUBLIC_BASE_URL.)\n\n"
+            "Meanwhile you can use /fetch <link>, or send files under 20 MB here."
+        )
+        return
+    link = server.create_link(update.effective_chat.id)
+    await update.message.reply_text(
+        f"Your private upload page (valid 2 hours):\n{link}\n\n"
+        "Open it in a browser and drag in statement files or zips - any size. "
+        "Results will arrive in this chat as each file is processed. "
+        "Don't share the link; anyone with it can add data to this catalog."
+    )
 
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -392,6 +432,39 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+async def _start_web_server(app: Application) -> None:
+    """post_init hook: run the upload page on the same event loop as the bot."""
+    from aiohttp import web
+
+    async def send_results(chat_id: str, text: str) -> None:
+        await _send_chunked(app.bot, int(chat_id), text)
+
+    server = UploadServer(
+        db_path=DB_PATH,
+        ingest_func=_ingest_blocking,
+        send_results=send_results,
+        base_url=PUBLIC_BASE_URL,
+    )
+    runner = web.AppRunner(server.build_app())
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", WEB_PORT).start()
+    app.bot_data["upload_server"] = server
+    app.bot_data["web_runner"] = runner
+    log.info(
+        "Upload page listening on port %s (public base: %s)",
+        WEB_PORT, PUBLIC_BASE_URL or "none - /upload will explain setup",
+    )
+
+
+async def _stop_web_server(app: Application) -> None:
+    server: UploadServer | None = app.bot_data.get("upload_server")
+    if server:
+        await server.drain()
+    runner = app.bot_data.get("web_runner")
+    if runner:
+        await runner.cleanup()
+
+
 def build_application(token: str) -> Application:
     builder = (
         Application.builder()
@@ -402,6 +475,8 @@ def build_application(token: str) -> Application:
         .read_timeout(300)
         .write_timeout(300)
         .pool_timeout(60)
+        .post_init(_start_web_server)
+        .post_shutdown(_stop_web_server)
     )
     if API_BASE_URL:
         builder = builder.base_url(API_BASE_URL)
@@ -410,6 +485,7 @@ def build_application(token: str) -> Application:
     app = builder.build()
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
     app.add_handler(CommandHandler("report", cmd_report))
+    app.add_handler(CommandHandler("upload", cmd_upload))
     app.add_handler(CommandHandler("fetch", cmd_fetch))
     app.add_handler(CommandHandler("uncategorized", cmd_uncategorized))
     app.add_handler(CommandHandler("categorize", cmd_categorize))
