@@ -47,9 +47,12 @@ _FIELD_ALIASES: dict[str, list[str]] = {
         "netamount", "netroyalty", "netroyalties", "netrevenue", "netearnings",
         "netincome", "netpayable", "netamountpayable", "netpayout", "amountdue",
         "amountpayable", "royaltyamount", "royaltiesearned", "royaltyearned",
-        "yourshare", "payableamount", "earnings", "earningsusd", "royalty",
+        "yourshare", "payableamount", "netdistamount", "netdistribution",
+        "netpayment", "paymentamount", "amountpaid", "royaltyvalue",
+        "distamount", "distributionamount", "earnings", "royalty",
         "royalties", "payout", "revenue", "income", "amount", "total",
-        "totalamount", "totalearnings", "value", "netdue",
+        "totalamount", "totalearnings", "totalroyalty", "totalroyalties",
+        "value", "netdue", "grossamount", "grossroyalty",
     ],
     "date": [
         "transactiondate", "statementdate", "paymentdate", "saledate",
@@ -92,6 +95,23 @@ _ALIAS_LOOKUP: dict[str, tuple[str, int]] = {}
 for _field, _aliases in _FIELD_ALIASES.items():
     for _rank, _alias in enumerate(_aliases):
         _ALIAS_LOOKUP.setdefault(_alias, (_field, _rank))
+
+_CURRENCY_SUFFIXES = (
+    "gbp", "usd", "eur", "cad", "aud", "jpy", "chf", "sek", "nok", "dkk",
+    "nzd", "brl", "mxn", "sterling", "dollars", "euros", "pounds",
+)
+
+
+def _lookup_alias(normalized: str) -> tuple[str, int] | None:
+    """Alias lookup that also tolerates currency-qualified headers, so
+    'Earnings (USD)', 'Amount GBP' and 'Net Amount EUR' all resolve."""
+    hit = _ALIAS_LOOKUP.get(normalized)
+    if hit:
+        return hit
+    for suffix in _CURRENCY_SUFFIXES:
+        if normalized.endswith(suffix) and len(normalized) > len(suffix):
+            return _ALIAS_LOOKUP.get(normalized[: -len(suffix)])
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +328,24 @@ def _iter_raw_rows(path: Path) -> Iterator[list[str]]:
                 yield [c.strip() for c in row]
 
 
+def _preview(rows: list[list[str]], max_rows: int = 4, max_cells: int = 8,
+             cell_width: int = 24) -> str:
+    """Compact preview of a file's first rows, for unrecognized-format errors."""
+    lines = []
+    for cells in rows:
+        if not any(cells):
+            continue
+        shown = [
+            (c[: cell_width - 1] + "…") if len(c) > cell_width else c
+            for c in cells[:max_cells]
+        ]
+        suffix = f" …+{len(cells) - max_cells} cols" if len(cells) > max_cells else ""
+        lines.append(" | ".join(shown) + suffix)
+        if len(lines) >= max_rows:
+            break
+    return "\n".join(lines) if lines else "(file appears empty)"
+
+
 def _scan_for_header(rows: list[list[str]]) -> tuple[int, dict[int, tuple[str, int]]]:
     """Locate the header row: the first row where cells map to known fields
     (at minimum an amount column). Returns (row_index, {col_index: (field, rank)}).
@@ -318,7 +356,7 @@ def _scan_for_header(rows: list[list[str]]) -> tuple[int, dict[int, tuple[str, i
         for col_idx, cell in enumerate(cells):
             if not cell:
                 continue
-            hit = _ALIAS_LOOKUP.get(_norm_header(cell))
+            hit = _lookup_alias(_norm_header(cell))
             if hit:
                 mapping[col_idx] = hit
         fields_found = {f for f, _ in mapping.values()}
@@ -330,7 +368,8 @@ def _scan_for_header(rows: list[list[str]]) -> tuple[int, dict[int, tuple[str, i
         return best
     raise ValueError(
         "Could not find a header row with recognizable columns "
-        "(need at least an amount column such as 'Net Amount', 'Earnings' or 'Royalty')."
+        "(need at least an amount column such as 'Net Amount', 'Earnings' or "
+        "'Royalty'). The file starts like this:\n" + _preview(rows)
     )
 
 
@@ -343,7 +382,7 @@ class StatementReader:
     iteration; call `finalize_warnings()` after consuming the iterator.
     """
 
-    HEADER_SCAN_ROWS = 15
+    HEADER_SCAN_ROWS = 40   # some statements bury the header under long preambles
 
     def __init__(self, path: str | Path, filename: str | None = None):
         self.path = Path(path)
@@ -369,7 +408,10 @@ class StatementReader:
                 chosen[field_name] = col_idx
                 chosen_rank[field_name] = rank
         if "amount" not in chosen:
-            raise ValueError("No amount column recognized in this file.")
+            raise ValueError(
+                "No amount column recognized in this file. "
+                "The file starts like this:\n" + _preview(buffered)
+            )
 
         self._headers = headers
         self._chosen = chosen

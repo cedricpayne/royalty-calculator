@@ -123,11 +123,30 @@ def test_header_not_on_first_line(tmp_path):
     assert result.rows[0].category == "Masters"
 
 
-def test_unrecognizable_file_raises(tmp_path):
+def test_unrecognizable_file_raises_with_preview(tmp_path):
     p = tmp_path / "junk.csv"
     p.write_text("a,b,c\n1,2,3\n")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as exc:
         parse_file(p)
+    # The error shows the file's first rows so unknown formats can be mapped.
+    assert "a | b | c" in str(exc.value)
+
+
+def test_currency_qualified_amount_headers(tmp_path):
+    p = tmp_path / "gbp.csv"
+    p.write_text("Date,Track,Amount GBP\n2025-03-01,Song,12.50\n")
+    result = parse_file(p)
+    assert result.column_map["amount"] == "Amount GBP"
+    assert result.rows[0].amount == Decimal("12.50")
+
+
+def test_deep_header_found(tmp_path):
+    preamble = "".join(f"Info line {i},,,\n" for i in range(30))
+    p = tmp_path / "deep.csv"
+    p.write_text(preamble + "Date,Track,Net Amount\n2025-03-01,Song,9.99\n")
+    result = parse_file(p)
+    assert len(result.rows) == 1
+    assert result.rows[0].amount == Decimal("9.99")
 
 
 def test_fingerprint_stable_and_distinct():
