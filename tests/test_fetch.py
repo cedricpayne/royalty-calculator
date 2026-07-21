@@ -6,7 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from royaltycalc.fetch import ShareResolveError, download_statement
+from royaltycalc.fetch import (
+    ShareResolveError,
+    _confirm_form_url,
+    _gdrive_candidates,
+    _gdrive_file_id,
+    download_statement,
+)
 
 CSV_BODY = b"Date,Store,Earnings\n2025-05-01,Spotify,10.00\n"
 
@@ -129,3 +135,62 @@ def test_size_cap_enforced(server, tmp_path):
     ROUTES["/big.csv"] = (200, {"Content-Type": "text/csv"}, b"x" * 5000)
     with pytest.raises(ValueError):
         download_statement(f"{server}/big.csv", tmp_path, 1000)
+
+
+# ------------------------------------------------------------- Google Drive
+
+def test_gdrive_file_id_extraction():
+    fid = "1OA8WrTAbt-SbWRMAAG6HjvhEiLzepuuA"
+    assert _gdrive_file_id(
+        f"https://drive.google.com/file/d/{fid}/view?usp=drivesdk"
+    ) == fid
+    assert _gdrive_file_id(
+        f"https://drive.google.com/uc?export=download&id={fid}"
+    ) == fid
+    assert _gdrive_file_id("https://example.com/file/d/abcdefghijkl/view") is None
+
+
+def test_gdrive_candidates_hit_download_endpoints():
+    fid = "1OA8WrTAbt-SbWRMAAG6HjvhEiLzepuuA"
+    cands = _gdrive_candidates(f"https://drive.google.com/file/d/{fid}/view?usp=drivesdk")
+    assert len(cands) == 2
+    assert all(fid in c and "confirm=t" in c for c in cands)
+    assert "drive.usercontent.google.com/download" in cands[0]
+
+
+def test_confirm_form_url_rebuilds_hidden_inputs():
+    html = (
+        '<html><body><form id="download-form" action="https://drive.usercontent'
+        '.google.com/download" method="get">'
+        '<input type="hidden" name="id" value="FILEID">'
+        '<input type="hidden" name="confirm" value="t">'
+        '<input type="hidden" name="uuid" value="u-1">'
+        "<input type='submit' value='Download anyway'></form></body></html>"
+    )
+    url = _confirm_form_url("https://drive.google.com/uc?id=FILEID", html)
+    assert url.startswith("https://drive.usercontent.google.com/download?")
+    assert "id=FILEID" in url and "confirm=t" in url and "uuid=u-1" in url
+
+
+def test_interstitial_confirm_flow(server, tmp_path):
+    # A share URL that serves a virus-scan-style confirm form, whose action
+    # (with hidden inputs) serves the real file.
+    form = (
+        '<html><body><p>This file cannot be scanned.</p>'
+        f'<form action="{server}/real-download" method="get">'
+        '<input type="hidden" name="id" value="F123">'
+        '<input type="hidden" name="confirm" value="t">'
+        "<input type='submit'></form></body></html>"
+    ).encode()
+    ROUTES["/share/scan"] = (200, {"Content-Type": "text/html"}, form)
+    ROUTES["/real-download?id=F123&confirm=t"] = (
+        200,
+        {
+            "Content-Type": "text/csv",
+            "Content-Disposition": 'attachment; filename="royalties.csv"',
+        },
+        CSV_BODY,
+    )
+    path, name = download_statement(f"{server}/share/scan", tmp_path, 10**6)
+    assert name == "royalties.csv"
+    assert path.read_bytes() == CSV_BODY

@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
 
 import httpx
 
@@ -95,6 +95,57 @@ def _hightail_candidates(url: str) -> list[str]:
         base = url.split("?")[0].rstrip("/")
         return [base + "/download", base + "/download/all"]
     return []
+
+
+def _gdrive_file_id(url: str) -> str | None:
+    parsed = urlparse(url)
+    if parsed.hostname not in {"drive.google.com", "docs.google.com",
+                               "drive.usercontent.google.com"}:
+        return None
+    m = re.search(r"/file/d/([A-Za-z0-9_-]{10,})", parsed.path)
+    if m:
+        return m.group(1)
+    ids = parse_qs(parsed.query).get("id")
+    return ids[0] if ids else None
+
+
+def _gdrive_candidates(url: str) -> list[str]:
+    """Google Drive viewer links (/file/d/<id>/view) serve an HTML page; the
+    file bytes live on the download endpoints. confirm=t pre-answers the
+    'can't scan this file for viruses' prompt on large files."""
+    fid = _gdrive_file_id(url)
+    if not fid:
+        return []
+    return [
+        f"https://drive.usercontent.google.com/download?id={fid}&export=download&confirm=t",
+        f"https://drive.google.com/uc?export=download&confirm=t&id={fid}",
+    ]
+
+
+def _host_candidates(url: str) -> list[str]:
+    return _gdrive_candidates(url) + _hightail_candidates(url)
+
+
+_FORM_RE = re.compile(r'<form[^>]*action="([^"]*)"[^>]*>(.*?)</form>', re.I | re.S)
+_INPUT_RE = re.compile(r"<input[^>]*>", re.I)
+
+
+def _confirm_form_url(base_url: str, html: str) -> str | None:
+    """Rebuild a download-confirm form (e.g. Drive's virus-scan interstitial)
+    as a GET URL from its action and hidden inputs."""
+    for action, body in _FORM_RE.findall(html):
+        if "download" not in action.lower():
+            continue
+        params = {}
+        for tag in _INPUT_RE.findall(body):
+            name = re.search(r'name="([^"]+)"', tag)
+            if not name:
+                continue
+            value = re.search(r'value="([^"]*)"', tag)
+            params[name.group(1)] = value.group(1) if value else ""
+        if params:
+            return urljoin(base_url, action) + "?" + urlencode(params)
+    return None
 
 
 def _score_candidate(base_url: str, candidate: str) -> int:
@@ -202,12 +253,26 @@ def download_statement(url: str, dest_dir: Path, max_bytes: int) -> tuple[Path, 
                         f"The link serves '{content_type or 'unknown content'}', "
                         "not a statement file."
                     )
+                final_host = urlparse(str(resp.url)).hostname or ""
+                if final_host.endswith("accounts.google.com"):
+                    raise ShareResolveError(
+                        "This Google Drive file requires sign-in. In Drive, set "
+                        "sharing to 'Anyone with the link' and try again."
+                    )
                 page = b""
                 for chunk in resp.iter_bytes(64 * 1024):
                     page += chunk
                     if len(page) >= MAX_PAGE_BYTES:
                         break
             html = page.decode("utf-8", errors="replace")
+            # Download-confirm interstitials (Drive's virus-scan page): rebuild
+            # the form as a URL and follow it before generic link scraping.
+            confirm = _confirm_form_url(str(resp.url), html)
+            if confirm:
+                try:
+                    return attempt(confirm, depth + 1)
+                except (httpx.HTTPError, ValueError) as e:
+                    log.info("Confirm-form URL %s failed: %s", confirm, e)
             candidates = _extract_candidates(str(resp.url), html)
             log.info("Share page %s: trying %d candidate link(s)", target_url, len(candidates))
             for candidate in candidates:
@@ -221,9 +286,11 @@ def download_statement(url: str, dest_dir: Path, max_bytes: int) -> tuple[Path, 
             )
 
         # Host-specific fast paths tried before the generic page scrape.
-        for candidate in _hightail_candidates(url):
+        for candidate in _host_candidates(url):
             try:
                 return attempt(candidate, 1)
+            except ShareResolveError:
+                raise  # definitive (e.g. Drive file needs sign-in) - don't mask it
             except (httpx.HTTPError, ValueError) as e:
-                log.info("Hightail fast path %s failed: %s", candidate, e)
+                log.info("Fast path %s failed: %s", candidate, e)
         return attempt(url, 0)
