@@ -451,8 +451,12 @@ class StatementReader:
             if amount is None:
                 self._skip(row_number, "no parseable amount")
                 continue
+            # Cheap first-letter prefilter: the regex only ever matches values
+            # starting with total/subtotal/grand, so skip the rest outright.
             if _TOTAL_ROW_RE.match(first_cell) or any(
-                _TOTAL_ROW_RE.match(v) for v in raw.values() if v
+                _TOTAL_ROW_RE.match(v)
+                for v in raw.values()
+                if v and v[0] in "tTgGsS"
             ):
                 self._skip(row_number, "looks like a total/subtotal row")
                 continue

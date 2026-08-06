@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
@@ -43,6 +44,7 @@ CREATE TABLE IF NOT EXISTS files (
     rows_duplicate INTEGER NOT NULL DEFAULT 0,
     rows_skipped INTEGER NOT NULL DEFAULT 0,
     column_map TEXT,
+    currencies TEXT,
     UNIQUE (chat_id, sha256)
 );
 
@@ -70,14 +72,18 @@ CREATE TABLE IF NOT EXISTS transactions (
     raw_json TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_txn_chat ON transactions (chat_id, is_duplicate);
 CREATE INDEX IF NOT EXISTS idx_txn_fingerprint ON transactions (chat_id, fingerprint);
-CREATE INDEX IF NOT EXISTS idx_txn_year ON transactions (chat_id, year);
 CREATE INDEX IF NOT EXISTS idx_txn_file ON transactions (file_id);
+-- Covering indexes so /report aggregates never touch the (wide) table rows.
+CREATE INDEX IF NOT EXISTS idx_report_date
+    ON transactions (chat_id, is_duplicate, txn_date, amount_micros);
+CREATE INDEX IF NOT EXISTS idx_report_cat
+    ON transactions (chat_id, is_duplicate, category, amount_micros);
 """
 
 INSERT_BATCH_SIZE = 2000
 COMMIT_EVERY_ROWS = 100_000   # fsync cadence during bulk ingest
+COMPRESS_RAW_OVER = 120       # zlib raw rows longer than this (bytes as stored)
 
 
 def to_micros(amount: Decimal) -> int:
@@ -88,6 +94,24 @@ def to_micros(amount: Decimal) -> int:
 
 def from_micros(micros: int | None) -> Decimal:
     return Decimal(micros or 0).scaleb(-6)
+
+
+def encode_raw(raw: dict) -> str | bytes:
+    """Serialize a raw statement row, zlib-compressing anything non-trivial.
+
+    Raw rows dominate database size (they make every number traceable);
+    compression roughly halves the on-disk footprint of a big catalog."""
+    payload = json.dumps(raw, ensure_ascii=False)
+    if len(payload) > COMPRESS_RAW_OVER:
+        return zlib.compress(payload.encode("utf-8"), 6)
+    return payload
+
+
+def decode_raw(value: str | bytes) -> dict:
+    """Inverse of encode_raw; transparently reads pre-compression rows too."""
+    if isinstance(value, bytes):
+        value = zlib.decompress(value).decode("utf-8")
+    return json.loads(value)
 
 
 class DuplicateFileError(Exception):
@@ -124,10 +148,19 @@ class Store:
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")
         self.conn.execute("PRAGMA synchronous = NORMAL")
+        # A writer (bulk ingest) and readers (/report) coexist; wait instead of
+        # failing with 'database is locked'.
+        self.conn.execute("PRAGMA busy_timeout = 30000")
+        # Modest, container-friendly memory settings: Railway starter plans
+        # have little RAM, and the covering indexes do the heavy lifting.
+        # temp_store stays on disk - duplicate-marking materializes a temp
+        # structure proportional to the file being ingested.
+        self.conn.execute("PRAGMA cache_size = -32768")     # 32 MB page cache
+        self._migrate_columns()
         self.conn.executescript(_SCHEMA)
-        self._migrate()
+        self._migrate_indexes()
 
-    def _migrate(self) -> None:
+    def _migrate_columns(self) -> None:
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(transactions)")}
         if cols and "amount_micros" not in cols:
             self.conn.execute(
@@ -138,6 +171,16 @@ class Store:
                 "CAST(ROUND(CAST(amount AS REAL) * 1000000) AS INTEGER)"
             )
             self.conn.commit()
+        file_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(files)")}
+        if file_cols and "currencies" not in file_cols:
+            self.conn.execute("ALTER TABLE files ADD COLUMN currencies TEXT")
+            self.conn.commit()
+
+    def _migrate_indexes(self) -> None:
+        # Superseded by the covering report indexes in _SCHEMA.
+        self.conn.execute("DROP INDEX IF EXISTS idx_txn_chat")
+        self.conn.execute("DROP INDEX IF EXISTS idx_txn_year")
+        self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
@@ -204,9 +247,12 @@ class Store:
             ).fetchone()
 
             skipped_count = getattr(reader, "skipped_count", 0)
+            currencies = sorted(getattr(reader, "currencies", []) or [])
             self.conn.execute(
-                "UPDATE files SET rows_ingested=?, rows_duplicate=?, rows_skipped=? WHERE id=?",
-                (counts["ingested"], counts["dups"], skipped_count, file_id),
+                "UPDATE files SET rows_ingested=?, rows_duplicate=?, rows_skipped=?, "
+                "currencies=? WHERE id=?",
+                (counts["ingested"], counts["dups"], skipped_count,
+                 json.dumps(currencies), file_id),
             )
             self.conn.commit()
         except Exception:
@@ -238,7 +284,7 @@ class Store:
             r.txn_date.year if r.txn_date else None,
             str(r.amount), to_micros(r.amount), r.currency, r.category,
             r.category_reason, r.income_type, r.source, r.track, r.artist,
-            r.description, r.fingerprint, json.dumps(r.raw, ensure_ascii=False),
+            r.description, r.fingerprint, encode_raw(r.raw),
         )
 
     def _flush(self, batch: list[tuple]) -> None:
@@ -291,6 +337,7 @@ class Store:
         q = "SELECT * FROM transactions WHERE chat_id=?"
         if not include_duplicates:
             q += " AND is_duplicate=0"
+        q += " ORDER BY id"
         return self.conn.execute(q, (str(chat_id),)).fetchall()
 
     def uncategorized(self, chat_id: str | int, limit: int = 50):

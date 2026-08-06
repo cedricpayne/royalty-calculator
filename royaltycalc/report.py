@@ -6,6 +6,7 @@ memory-flat even with millions of ingested transactions.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field as dc_field
 from datetime import date
 from decimal import Decimal
@@ -69,12 +70,14 @@ def build_report(store: Store, chat_id: str | int, as_of: date | None = None) ->
         else:
             rep.by_category[r["category"]] = from_micros(r["t"])
 
+    # Year from the txn_date prefix so the covering index (chat_id,
+    # is_duplicate, txn_date, amount_micros) satisfies the whole query.
     for r in conn.execute(
-        f"SELECT year, COALESCE(SUM(amount_micros),0) AS t "
-        f"{base} AND year IS NOT NULL GROUP BY year",
+        f"SELECT substr(txn_date, 1, 4) AS y, COALESCE(SUM(amount_micros),0) AS t "
+        f"{base} AND txn_date IS NOT NULL GROUP BY y",
         (chat,),
     ):
-        rep.by_year[int(r["year"])] = from_micros(r["t"])
+        rep.by_year[int(r["y"])] = from_micros(r["t"])
 
     ltm = conn.execute(
         f"SELECT COALESCE(SUM(amount_micros),0) AS t {base} "
@@ -83,10 +86,20 @@ def build_report(store: Store, chat_id: str | int, as_of: date | None = None) ->
     ).fetchone()
     rep.ltm_total = from_micros(ltm["t"])
 
-    for r in conn.execute(
-        f"SELECT DISTINCT currency {base} AND currency IS NOT NULL", (chat,)
-    ):
-        rep.currencies.add(r["currency"])
+    # Currencies come from per-file summaries recorded at ingest (a handful of
+    # rows) instead of scanning millions of transactions; fall back to a scan
+    # only for files ingested before the summary column existed.
+    need_scan = False
+    for r in conn.execute("SELECT currencies FROM files WHERE chat_id=?", (chat,)):
+        if r["currencies"] is None:
+            need_scan = True
+        else:
+            rep.currencies.update(json.loads(r["currencies"]))
+    if need_scan:
+        for r in conn.execute(
+            f"SELECT DISTINCT currency {base} AND currency IS NOT NULL", (chat,)
+        ):
+            rep.currencies.add(r["currency"])
 
     return rep
 

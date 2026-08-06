@@ -32,7 +32,7 @@ from .categorize import CATEGORIES, resolve_category_name
 from .fetch import ShareResolveError, download_statement
 from .ingest import UPLOAD_EXTENSIONS, ingest_upload
 from .report import build_report, fmt_money, render_report
-from .store import Store
+from .store import Store, decode_raw
 from .webupload import UploadServer
 
 logging.basicConfig(
@@ -369,7 +369,7 @@ async def cmd_trace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if r is None:
         await update.message.reply_text(f"No transaction #{txn_id} found in this chat.")
         return
-    raw = json.dumps(json.loads(r["raw_json"]), indent=2, ensure_ascii=False)
+    raw = json.dumps(decode_raw(r["raw_json"]), indent=2, ensure_ascii=False)
     dup = ""
     if r["is_duplicate"]:
         dup = f"\nDUPLICATE - excluded from totals (same as transaction #{r['duplicate_of']})"

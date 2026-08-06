@@ -6,7 +6,7 @@ import pytest
 
 from royaltycalc.ingest import ingest_file
 from royaltycalc.report import build_report, render_report
-from royaltycalc.store import DuplicateFileError, Store
+from royaltycalc.store import DuplicateFileError, Store, decode_raw, encode_raw
 
 SAMPLES = Path(__file__).resolve().parent.parent / "samples"
 CHAT = "testchat"
@@ -121,8 +121,32 @@ def test_traceability(store):
     txn = store.get_transaction(CHAT, rows[0]["id"])
     assert txn["filename"] == "distrokid_2025.csv"
     assert txn["row_number"] == 2  # first data row after the header
-    assert "Spotify" in txn["raw_json"]
+    raw = decode_raw(txn["raw_json"])
+    assert raw["Store"] == "Spotify"
+    assert raw["Sale Month"] == "2025-01"
     assert txn["sha256"]
+
+
+def test_encode_raw_roundtrip_and_compression():
+    small = {"a": "1"}
+    assert decode_raw(encode_raw(small)) == small
+    assert isinstance(encode_raw(small), str)  # tiny rows stay as plain text
+    big = {f"Column {i}": f"value {i}" for i in range(20)}
+    encoded = encode_raw(big)
+    assert isinstance(encoded, bytes)          # larger rows are compressed
+    assert decode_raw(encoded) == big
+
+
+def test_report_currencies_from_file_summaries(store, tmp_path):
+    mixed = tmp_path / "mixed.csv"
+    mixed.write_text(
+        "Date,Store,Currency,Earnings\n"
+        "2025-01-15,Spotify,USD,10.00\n"
+        "2025-02-15,Deezer,EUR,8.00\n"
+    )
+    ingest_file(store, CHAT, mixed)
+    rep = build_report(store, CHAT, as_of=date(2026, 7, 20))
+    assert rep.currencies == {"USD", "EUR"}
 
 
 def test_manual_categorize_updates_report(store):

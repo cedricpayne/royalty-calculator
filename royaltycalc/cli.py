@@ -16,7 +16,7 @@ from decimal import Decimal
 
 from .ingest import ingest_file, summary_text
 from .report import build_report, fmt_money, render_report
-from .store import DuplicateFileError, Store
+from .store import DuplicateFileError, Store, decode_raw
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -86,7 +86,7 @@ def main(argv: list[str] | None = None) -> int:
         if r["is_duplicate"]:
             print(f"DUPLICATE of transaction #{r['duplicate_of']} - excluded from totals")
         print("Original row:")
-        print(json.dumps(json.loads(r["raw_json"]), indent=2, ensure_ascii=False))
+        print(json.dumps(decode_raw(r["raw_json"]), indent=2, ensure_ascii=False))
     elif args.cmd == "categorize":
         from .categorize import resolve_category_name
 
