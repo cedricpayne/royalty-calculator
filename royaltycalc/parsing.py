@@ -297,35 +297,47 @@ def _cell_to_str(v) -> str:
     return "" if s.lower() == "nan" else s
 
 
-def _iter_raw_rows(path: Path) -> Iterator[list[str]]:
-    """Yield each row of the file as a list of stripped cell strings, lazily."""
+def _delimited_rows(path: Path) -> Iterator[list[str]]:
+    with open(path, newline="", encoding="utf-8-sig", errors="replace") as fh:
+        sample = fh.read(64 * 1024)
+        fh.seek(0)
+        try:
+            delimiter = csv.Sniffer().sniff(sample, delimiters=",;\t|").delimiter
+        except csv.Error:
+            delimiter = ","
+        for row in csv.reader(fh, delimiter=delimiter):
+            yield [c.strip() for c in row]
+
+
+def _xlsx_sheet_rows(ws) -> Iterator[list[str]]:
+    for row in ws.iter_rows(values_only=True):
+        yield [_cell_to_str(c) for c in row]
+
+
+def _sheet_iterators(path: Path) -> tuple[list[tuple[str, Iterator[list[str]]]], callable]:
+    """Return ((sheet_name, row_iterator), ...) for every table in the file,
+    plus a close callback. CSVs have one unnamed sheet; workbooks expose every
+    worksheet so data hiding behind a cover sheet is still found."""
     suffix = path.suffix.lower()
     if suffix in {".xlsx", ".xlsm"}:
         from openpyxl import load_workbook
 
         wb = load_workbook(path, read_only=True, data_only=True)
-        try:
-            for row in wb.worksheets[0].iter_rows(values_only=True):
-                yield [_cell_to_str(c) for c in row]
-        finally:
-            wb.close()
-    elif suffix == ".xls":
+        return [(ws.title, _xlsx_sheet_rows(ws)) for ws in wb.worksheets], wb.close
+    if suffix == ".xls":
         # Legacy format with a hard 65k-row cap - small enough to load whole.
         import pandas as pd
 
-        df = pd.read_excel(path, header=None, dtype=str)
-        for _, row in df.iterrows():
-            yield ["" if pd.isna(c) else _cell_to_str(c) for c in row]
-    else:
-        with open(path, newline="", encoding="utf-8-sig", errors="replace") as fh:
-            sample = fh.read(64 * 1024)
-            fh.seek(0)
-            try:
-                delimiter = csv.Sniffer().sniff(sample, delimiters=",;\t|").delimiter
-            except csv.Error:
-                delimiter = ","
-            for row in csv.reader(fh, delimiter=delimiter):
-                yield [c.strip() for c in row]
+        frames = pd.read_excel(path, header=None, dtype=str, sheet_name=None)
+        sheets = []
+        for name, df in frames.items():
+            rows = [
+                ["" if pd.isna(c) else _cell_to_str(c) for c in row]
+                for _, row in df.iterrows()
+            ]
+            sheets.append((str(name), iter(rows)))
+        return sheets, (lambda: None)
+    return [("", _delimited_rows(path))], (lambda: None)
 
 
 def _preview(rows: list[list[str]], max_rows: int = 4, max_cells: int = 8,
@@ -373,6 +385,90 @@ def _scan_for_header(rows: list[list[str]]) -> tuple[int, dict[int, tuple[str, i
     )
 
 
+# ---------------------------------------------------------------------------
+# Content-based column inference (for files whose column names we don't know)
+# ---------------------------------------------------------------------------
+
+def _looks_like_money(s: str) -> bool:
+    """A value that parses as an amount AND carries a money hint (decimal
+    separator, currency symbol, negative). Bare integers are rejected so
+    quantity/ID/year columns don't masquerade as earnings."""
+    if not s or not any(ch.isdigit() for ch in s):
+        return False
+    if parse_amount(s) is None:
+        return False
+    return any(ch in s for ch in ".,$€£¥(") or s.startswith("-")
+
+
+def _plausible_date(s: str) -> bool:
+    if not s:
+        return False
+    # Money-shaped values are never date evidence: dateutil would happily read
+    # "10.50" as the time 10:50 today, which poisons column classification.
+    if _looks_like_money(s):
+        return False
+    d = parse_statement_date(s)
+    return d is not None and 1990 <= d.year <= 2035
+
+
+def _column_values(data_rows: list[list[str]], col: int) -> list[str]:
+    return [r[col] for r in data_rows if col < len(r) and r[col]]
+
+
+def _infer_amount_col(data_rows: list[list[str]], exclude: set[int]) -> int | None:
+    """Pick the most money-like column: highest fraction of money-shaped
+    values, rightmost on ties (statements put the payable amount last)."""
+    ncols = max((len(r) for r in data_rows), default=0)
+    best: tuple[float, int] | None = None
+    for col in range(ncols):
+        if col in exclude:
+            continue
+        vals = _column_values(data_rows, col)
+        if len(vals) < 2:
+            continue
+        money_frac = sum(_looks_like_money(v) for v in vals) / len(vals)
+        date_frac = sum(_plausible_date(v) for v in vals) / len(vals)
+        if money_frac < 0.7 or date_frac >= 0.7:
+            continue
+        if best is None or money_frac > best[0] or (money_frac == best[0] and col > best[1]):
+            best = (money_frac, col)
+    return best[1] if best else None
+
+
+def _infer_date_col(data_rows: list[list[str]], exclude: set[int]) -> int | None:
+    ncols = max((len(r) for r in data_rows), default=0)
+    best: tuple[float, int] | None = None
+    for col in range(ncols):
+        if col in exclude:
+            continue
+        vals = _column_values(data_rows, col)
+        if len(vals) < 2:
+            continue
+        frac = sum(_plausible_date(v) for v in vals) / len(vals)
+        if frac < 0.7:
+            continue
+        if best is None or frac > best[0]:   # ties keep the leftmost
+            best = (frac, col)
+    return best[1] if best else None
+
+
+def _text_columns(data_rows: list[list[str]], exclude: set[int]) -> list[int]:
+    """Columns that are mostly words - fed to the categorizer when no named
+    type/source/description columns exist."""
+    ncols = max((len(r) for r in data_rows), default=0)
+    out = []
+    for col in range(ncols):
+        if col in exclude:
+            continue
+        vals = _column_values(data_rows, col)
+        if len(vals) < 2:
+            continue
+        alpha = sum(any(ch.isalpha() for ch in v) for v in vals)
+        if alpha / len(vals) >= 0.5:
+            out.append(col)
+    return out
+
+
 class StatementReader:
     """Streams normalized transaction rows from one statement file.
 
@@ -391,34 +487,134 @@ class StatementReader:
         self.skipped_samples: list[tuple[int, str]] = []
         self.currencies: set[str] = set()
         self.warnings: list[str] = []
+        self._text_cols: list[int] = []
 
-        self._raw_iter = _iter_raw_rows(self.path)
-        buffered: list[list[str]] = []
-        for row in self._raw_iter:
-            buffered.append(row)
-            if len(buffered) >= self.HEADER_SCAN_ROWS:
-                break
-        header_idx, col_hits = _scan_for_header(buffered)
+        sheets, self._close = _sheet_iterators(self.path)
+        last_error: ValueError | None = None
+        for sheet_name, rows_iter in sheets:
+            buffered: list[list[str]] = []
+            for row in rows_iter:
+                buffered.append(row)
+                if len(buffered) >= self.HEADER_SCAN_ROWS:
+                    break
+            try:
+                self.warnings = []
+                self._configure(buffered)
+            except ValueError as e:
+                last_error = e
+                continue
+            self._raw_iter = rows_iter
+            if sheet_name and len(sheets) > 1:
+                self.warnings.append(f"Using worksheet '{sheet_name}'.")
+            return
+        self._close()
+        raise last_error or ValueError("The file contains no rows.")
+
+    def _col_name(self, idx: int) -> str:
+        if idx < len(self._headers) and self._headers[idx]:
+            return self._headers[idx]
+        return f"column {idx + 1}"
+
+    def _configure(self, buffered: list[list[str]]) -> None:
+        """Map columns for one sheet: recognized header names first, content
+        inference to fill gaps, full inference when nothing is recognized."""
+        try:
+            header_idx, col_hits = _scan_for_header(buffered)
+        except ValueError:
+            self._configure_inferred(buffered)
+            return
+
         headers = buffered[header_idx]
-
         chosen: dict[str, int] = {}
         chosen_rank: dict[str, int] = {}
         for col_idx, (field_name, rank) in col_hits.items():
             if field_name not in chosen or rank < chosen_rank[field_name]:
                 chosen[field_name] = col_idx
                 chosen_rank[field_name] = rank
+
+        self._headers = headers
+        data_rows = buffered[header_idx + 1:]
         if "amount" not in chosen:
+            idx = _infer_amount_col(data_rows, exclude=set(chosen.values()))
+            if idx is None:
+                raise ValueError(
+                    "No amount column recognized in this file. "
+                    "The file starts like this:\n" + _preview(buffered)
+                )
+            chosen["amount"] = idx
+            self.warnings.append(
+                f"Amount column inferred from the data: '{self._col_name(idx)}'. "
+                "Spot-check a few transactions with /trace."
+            )
+        if "date" not in chosen:
+            idx = _infer_date_col(data_rows, exclude=set(chosen.values()))
+            if idx is not None:
+                chosen["date"] = idx
+                self.warnings.append(
+                    f"Date column inferred from the data: '{self._col_name(idx)}'."
+                )
+            else:
+                self.warnings.append(
+                    "No date/period column recognized - rows will need manual review."
+                )
+        # When no type/source/description columns exist, categorize from
+        # whatever text columns the sheet has.
+        if not any(f in chosen for f in ("income_type", "source", "description")):
+            self._text_cols = _text_columns(data_rows, exclude=set(chosen.values()))
+
+        self._chosen = chosen
+        self._header_idx = header_idx
+        self._pending = data_rows
+        self._header_currency = detect_currency(None, headers[chosen["amount"]]
+                                                if chosen["amount"] < len(headers) else None)
+        self.column_map = {f: self._col_name(idx) for f, idx in chosen.items()}
+
+    def _configure_inferred(self, buffered: list[list[str]]) -> None:
+        """No recognizable column names anywhere: find where data starts and
+        classify columns purely by content (headerless exports like PRS 052)."""
+        data_start = next(
+            (i for i, row in enumerate(buffered) if any(_looks_like_money(c) for c in row)),
+            None,
+        )
+        if data_start is None:
+            raise ValueError(
+                "Could not find a header row with recognizable columns "
+                "(need at least an amount column such as 'Net Amount', 'Earnings' or "
+                "'Royalty'). The file starts like this:\n" + _preview(buffered)
+            )
+        header_idx = -1
+        for i in range(data_start - 1, -1, -1):
+            cells = buffered[i]
+            if sum(1 for c in cells if c) >= 2 and any(
+                any(ch.isalpha() for ch in c) for c in cells
+            ):
+                header_idx = i
+                break
+
+        data_rows = buffered[data_start:]
+        amount_idx = _infer_amount_col(data_rows, exclude=set())
+        if amount_idx is None:
             raise ValueError(
                 "No amount column recognized in this file. "
                 "The file starts like this:\n" + _preview(buffered)
             )
+        chosen: dict[str, int] = {"amount": amount_idx}
+        date_idx = _infer_date_col(data_rows, exclude={amount_idx})
+        if date_idx is not None:
+            chosen["date"] = date_idx
 
-        self._headers = headers
+        self._headers = buffered[header_idx] if header_idx >= 0 else []
         self._chosen = chosen
-        self._header_idx = header_idx
-        self._pending = buffered[header_idx + 1:]
-        self._header_currency = detect_currency(None, headers[chosen["amount"]])
-        self.column_map = {f: headers[idx] for f, idx in chosen.items()}
+        self._header_idx = data_start - 1
+        self._pending = data_rows
+        self._header_currency = None
+        self._text_cols = _text_columns(data_rows, exclude=set(chosen.values()))
+        self.column_map = {f: self._col_name(idx) for f, idx in chosen.items()}
+        described = ", ".join(f"{f}: {self._col_name(i)}" for f, i in chosen.items())
+        self.warnings.append(
+            f"No recognized column names - columns were inferred from the data "
+            f"({described}). Spot-check a few transactions with /trace."
+        )
         if "date" not in chosen:
             self.warnings.append(
                 "No date/period column recognized - rows will need manual review."
@@ -436,6 +632,12 @@ class StatementReader:
             self.skipped_samples.append((row_number, reason))
 
     def __iter__(self) -> Iterator[ParsedRow]:
+        try:
+            yield from self._rows()
+        finally:
+            self._close()
+
+    def _rows(self) -> Iterator[ParsedRow]:
         headers = self._headers
         for offset, cells in enumerate(chain(self._pending, self._raw_iter)):
             row_number = self._header_idx + 2 + offset  # 1-based position in file
@@ -465,6 +667,12 @@ class StatementReader:
             income_type = self._cell(cells, "income_type")
             source = self._cell(cells, "source")
             description = self._cell(cells, "description")
+            if description is None and self._text_cols:
+                # Inferred layout: categorize from the sheet's text columns.
+                blob = " ".join(
+                    cells[i] for i in self._text_cols if i < len(cells) and cells[i]
+                )
+                description = blob[:200] or None
             currency = (
                 self._cell(cells, "currency")
                 or detect_currency(self._cell(cells, "amount"), None)

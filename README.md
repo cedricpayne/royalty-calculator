@@ -33,6 +33,15 @@ It does not value the catalog or apply a multiple.
   become the amount; `Sale Month`, `Distribution Period`, `Statement Date`, `Q1 2025`,
   `Mar 2025`, ... all become the date). Preamble rows before the header are skipped,
   and total/subtotal rows are excluded.
+- **Infers unknown layouts from the data itself.** When column names aren't
+  recognized - or there is no header row at all (e.g. PRS 052 exports) - the
+  parser classifies columns by content: decimal/currency-shaped values become
+  the amount (bare-integer quantity and ID columns are rejected), date-shaped
+  values become the date, and text columns feed the categorizer. Workbooks are
+  scanned sheet by sheet, so data behind a cover sheet is found. Every inferred
+  mapping is flagged in the ingest summary so it can be spot-checked with
+  `/trace`; anything still unreadable errors with a preview of the file's first
+  rows.
 - **Categorizes every transaction** into Masters, Publishing, Producer Royalties,
   Neighbouring Rights or Other, using keyword rules over the stated royalty type,
   the payor/store, the description, and finally the filename. PROs (ASCAP, BMI,
