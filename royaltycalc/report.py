@@ -104,6 +104,63 @@ def build_report(store: Store, chat_id: str | int, as_of: date | None = None) ->
     return rep
 
 
+def catalog_context(store: Store, chat_id: str | int, as_of: date | None = None) -> str:
+    """Compact text bundle of catalog aggregates, used as grounding for /ask.
+
+    Everything comes from SQL aggregation, so the context stays small no
+    matter how many transactions exist."""
+    chat = str(chat_id)
+    conn = store.conn
+    base = "FROM transactions WHERE chat_id=? AND is_duplicate=0"
+    rep = build_report(store, chat_id, as_of=as_of)
+    lines = ["== Summary report ==", render_report(rep), ""]
+
+    lines.append("== Category x year (all-time) ==")
+    for r in conn.execute(
+        f"SELECT category, substr(txn_date,1,4) AS y, SUM(amount_micros) AS t "
+        f"{base} AND txn_date IS NOT NULL GROUP BY category, y ORDER BY y, category",
+        (chat,),
+    ):
+        lines.append(f"{r['y']} {r['category']}: {fmt_money(from_micros(r['t']))}")
+
+    lines.append("")
+    lines.append("== Monthly totals (last 24 months present) ==")
+    for r in conn.execute(
+        f"SELECT substr(txn_date,1,7) AS m, SUM(amount_micros) AS t "
+        f"{base} AND txn_date IS NOT NULL GROUP BY m ORDER BY m DESC LIMIT 24",
+        (chat,),
+    ):
+        lines.append(f"{r['m']}: {fmt_money(from_micros(r['t']))}")
+
+    lines.append("")
+    lines.append("== Top sources (all-time) ==")
+    for r in conn.execute(
+        f"SELECT COALESCE(source, income_type, 'unknown') AS s, "
+        f"SUM(amount_micros) AS t, COUNT(*) AS n {base} "
+        f"GROUP BY s ORDER BY t DESC LIMIT 15",
+        (chat,),
+    ):
+        lines.append(f"{r['s']}: {fmt_money(from_micros(r['t']))} ({r['n']} txns)")
+
+    lines.append("")
+    lines.append("== Top tracks (all-time) ==")
+    for r in conn.execute(
+        f"SELECT track AS s, SUM(amount_micros) AS t {base} "
+        f"AND track IS NOT NULL GROUP BY s ORDER BY t DESC LIMIT 15",
+        (chat,),
+    ):
+        lines.append(f"{r['s']}: {fmt_money(from_micros(r['t']))}")
+
+    lines.append("")
+    lines.append("== Ingested statements ==")
+    for f in store.files(chat_id):
+        lines.append(
+            f"{f['filename']}: {f['rows_ingested']} rows, "
+            f"{f['rows_duplicate']} duplicates skipped"
+        )
+    return "\n".join(lines)
+
+
 def fmt_money(value: Decimal, symbol: str = "$") -> str:
     q = value.quantize(Decimal("0.01"))
     if q < 0:

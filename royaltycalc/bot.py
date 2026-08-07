@@ -28,10 +28,11 @@ from telegram.ext import (
     filters,
 )
 
+from . import ai
 from .categorize import CATEGORIES, resolve_category_name
 from .fetch import ShareResolveError, download_statement
 from .ingest import UPLOAD_EXTENSIONS, ingest_upload
-from .report import build_report, fmt_money, render_report
+from .report import build_report, catalog_context, fmt_money, render_report
 from .store import Store, decode_raw
 from .webupload import UploadServer
 
@@ -78,9 +79,11 @@ elsewhere.
 
 Commands:
 /report - LTM total, category breakdown and per-year earnings
+/ask <question> - ask anything about your catalog (or just type a question)
 /upload - get a private browser page for big uploads (no size limit)
 /fetch <url> - ingest from a link (direct file links and share pages like Hightail/Dropbox/Drive)
 /uncategorized - transactions needing manual review
+/autocategorize - let Claude classify the uncategorized transactions
 /categorize <id> <category> - assign a category (masters, publishing, producer, neighbouring, other)
 /trace <id> - show the original file, row and raw data for a transaction
 /files - list ingested statements
@@ -308,6 +311,116 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(render_report(rep))
 
 
+AI_DISABLED_TEXT = (
+    "AI features are off. Add an ANTHROPIC_API_KEY variable on the server "
+    "(get a key at console.anthropic.com) and they switch on: /ask questions, "
+    "/autocategorize, and automatic mapping of unrecognized statement layouts."
+)
+
+
+def _answer_blocking(db_path: str, chat_id: int, question: str) -> str:
+    store = Store(db_path)
+    try:
+        return ai.answer_question(question, catalog_context(store, chat_id))
+    finally:
+        store.close()
+
+
+async def _handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                           question: str) -> None:
+    chat_id = update.effective_chat.id
+    try:
+        answer = await asyncio.to_thread(_answer_blocking, DB_PATH, chat_id, question)
+    except ai.AIUnavailable as e:
+        await update.message.reply_text(str(e))
+        return
+    except Exception:
+        log.exception("AI question failed")
+        await update.message.reply_text(
+            "Something went wrong answering that. Try /report for the standard summary."
+        )
+        return
+    await _send_chunked(context.bot, chat_id, answer)
+
+
+async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ai.ai_enabled():
+        await update.message.reply_text(AI_DISABLED_TEXT)
+        return
+    question = " ".join(context.args or [])
+    if not question:
+        await update.message.reply_text(
+            'Usage: /ask <question> - e.g. /ask "which track earned the most in 2025?"\n'
+            "You can also just type your question as a plain message."
+        )
+        return
+    await _handle_question(update, context, question)
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Plain (non-command) text: treat as a question about the catalog."""
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+    if not ai.ai_enabled():
+        await update.message.reply_text(
+            "Send me statement files to ingest, or /help for commands.\n" + AI_DISABLED_TEXT
+        )
+        return
+    await _handle_question(update, context, text)
+
+
+def _autocategorize_blocking(db_path: str, chat_id: int) -> str:
+    store = Store(db_path)
+    try:
+        rows = store.uncategorized(chat_id, limit=200)
+        if not rows:
+            return "No uncategorized transactions - everything is classified."
+        payload = []
+        for r in rows:
+            details = " | ".join(
+                str(v) for v in (
+                    r["txn_date"], r["amount"], r["currency"], r["income_type"],
+                    r["source"], r["track"], r["description"], r["filename"],
+                ) if v
+            )
+            payload.append({"id": r["id"], "text": details[:250]})
+        assignments = ai.categorize_rows(payload)
+        counts: dict[str, int] = {}
+        for txn_id, category in assignments.items():
+            if store.set_category(chat_id, txn_id, category, reason="categorized by Claude"):
+                counts[category] = counts.get(category, 0) + 1
+        if not counts:
+            return (
+                "Claude couldn't confidently classify any of them - they stay "
+                "in /uncategorized for manual review."
+            )
+        lines = ["Categorized by Claude:"]
+        lines += [f"  {cat}: {n} transaction(s)" for cat, n in sorted(counts.items())]
+        remaining = len(rows) - sum(counts.values())
+        if remaining:
+            lines.append(f"{remaining} left uncategorized (not enough information).")
+        lines.append("Spot-check with /trace <id>; totals update in /report.")
+        return "\n".join(lines)
+    finally:
+        store.close()
+
+
+async def cmd_autocategorize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ai.ai_enabled():
+        await update.message.reply_text(AI_DISABLED_TEXT)
+        return
+    await update.message.reply_text("Reviewing uncategorized transactions with Claude...")
+    try:
+        result = await asyncio.to_thread(
+            _autocategorize_blocking, DB_PATH, update.effective_chat.id
+        )
+    except Exception:
+        log.exception("Autocategorize failed")
+        result = "Something went wrong - the transactions remain in /uncategorized."
+    await update.message.reply_text(result)
+
+
 async def cmd_uncategorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     store = get_store(context)
     rows = store.uncategorized(update.effective_chat.id, limit=25)
@@ -485,6 +598,8 @@ def build_application(token: str) -> Application:
     app = builder.build()
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
     app.add_handler(CommandHandler("report", cmd_report))
+    app.add_handler(CommandHandler("ask", cmd_ask))
+    app.add_handler(CommandHandler("autocategorize", cmd_autocategorize))
     app.add_handler(CommandHandler("upload", cmd_upload))
     app.add_handler(CommandHandler("fetch", cmd_fetch))
     app.add_handler(CommandHandler("uncategorized", cmd_uncategorized))
@@ -494,6 +609,7 @@ def build_application(token: str) -> Application:
     app.add_handler(CommandHandler("deletefile", cmd_deletefile))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     return app
 
 

@@ -97,6 +97,34 @@ Each Telegram chat has its own isolated catalog. Data is stored in SQLite
 | `/deletefile <id>` | Remove a statement and its transactions |
 | `/reset` | Delete everything for this chat (requires `/reset confirm`) |
 
+## Plug in Claude (optional AI layer)
+
+Add one variable and the bot gets a brain:
+
+```
+ANTHROPIC_API_KEY=sk-ant-...        (from console.anthropic.com)
+```
+
+That switches on three capabilities, all built on the Claude API
+(`claude-opus-5` by default; override with `ROYALTY_AI_MODEL`):
+
+- **Automatic layout mapping.** When neither column-name matching nor content
+  inference can decode a statement, Claude reads the file's first rows and
+  returns the column mapping. Mappings are cached by layout fingerprint, so a
+  batch of 30 same-format statements costs one API call — and the mapping is
+  flagged in the ingest summary for `/trace` spot-checking.
+- **`/autocategorize`.** Claude classifies whatever sits in the Uncategorized
+  bucket into Masters / Publishing / Producer Royalties / Neighbouring Rights /
+  Other, marking each transaction as "categorized by Claude" for auditability.
+  Rows without enough information stay uncategorized.
+- **`/ask` and plain-text questions.** Ask anything about the catalog in
+  natural language ("which track earned the most in 2025?", "how did Q1
+  compare to last year?"). Answers are grounded in SQL aggregates computed
+  from your data — Claude never sees raw statements, only the summary tables.
+
+Without the key, everything falls back to the deterministic pipeline —
+no AI calls are ever made.
+
 ## Deploy on Railway
 
 The repo ships with `railway.json` (start command + restart policy), a `Procfile`

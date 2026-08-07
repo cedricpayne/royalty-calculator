@@ -8,7 +8,8 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-from .parsing import StatementReader, file_sha256
+from . import ai
+from .parsing import StatementReader, file_sha256, layout_signature, preview_rows
 from .store import DuplicateFileError, IngestSummary, Store
 
 log = logging.getLogger(__name__)
@@ -26,7 +27,12 @@ MAX_TOTAL_EXTRACTED = 4 * 1024 * 1024 * 1024  # 4 GB per archive
 
 def ingest_file(store: Store, chat_id: str | int, path: str | Path,
                 filename: str | None = None) -> IngestSummary:
-    """Ingest a single statement, streaming rows straight into the store."""
+    """Ingest a single statement, streaming rows straight into the store.
+
+    When neither header aliases nor content inference can decode the layout
+    and the AI layer is enabled, Claude maps the columns from a preview of
+    the file; mappings are cached by layout signature so a batch of
+    same-format statements costs a single API call."""
     path = Path(path)
     filename = filename or path.name
     if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
@@ -35,8 +41,45 @@ def ingest_file(store: Store, chat_id: str | int, path: str | Path,
             f"Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
         )
     sha256 = file_sha256(path)
-    reader = StatementReader(path, filename=filename)
+    try:
+        reader = StatementReader(path, filename=filename)
+    except ValueError as parse_error:
+        reader = _ai_reader(store, path, filename, parse_error)
     return store.ingest(chat_id, filename, sha256, reader)
+
+
+def _ai_reader(store: Store, path: Path, filename: str,
+               parse_error: ValueError) -> StatementReader:
+    """Last-resort layout mapping via Claude; re-raises the original parse
+    error whenever AI is unavailable or can't produce a working mapping."""
+    if not ai.ai_enabled():
+        raise parse_error
+    preview = preview_rows(path)
+    if not preview:
+        raise parse_error
+    signature = layout_signature(preview, path.suffix)
+
+    cached = store.get_layout(signature)
+    if cached is not None:
+        try:
+            return StatementReader(path, filename=filename, column_overrides=cached)
+        except ValueError:
+            log.warning("Cached layout %s no longer fits %s; re-mapping", signature, filename)
+
+    try:
+        mapping = ai.map_columns(preview, filename)
+    except Exception:
+        log.exception("AI column mapping failed for %s", filename)
+        raise parse_error from None
+    if mapping is None:
+        raise parse_error
+    try:
+        reader = StatementReader(path, filename=filename, column_overrides=mapping)
+    except ValueError:
+        raise parse_error from None
+    store.save_layout(signature, mapping)
+    log.info("AI mapped layout %s for %s", signature, filename)
+    return reader
 
 
 def _is_statement_member(info: zipfile.ZipInfo) -> bool:

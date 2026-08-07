@@ -480,7 +480,8 @@ class StatementReader:
 
     HEADER_SCAN_ROWS = 40   # some statements bury the header under long preambles
 
-    def __init__(self, path: str | Path, filename: str | None = None):
+    def __init__(self, path: str | Path, filename: str | None = None,
+                 column_overrides: dict | None = None):
         self.path = Path(path)
         self.filename = filename or self.path.name
         self.skipped_count = 0
@@ -499,7 +500,10 @@ class StatementReader:
                     break
             try:
                 self.warnings = []
-                self._configure(buffered)
+                if column_overrides is not None:
+                    self._configure_overrides(buffered, column_overrides)
+                else:
+                    self._configure(buffered)
             except ValueError as e:
                 last_error = e
                 continue
@@ -509,6 +513,39 @@ class StatementReader:
             return
         self._close()
         raise last_error or ValueError("The file contains no rows.")
+
+    def _configure_overrides(self, buffered: list[list[str]], overrides: dict) -> None:
+        """Apply an externally supplied column mapping (e.g. from Claude)."""
+        columns = {f: int(i) for f, i in overrides.get("columns", {}).items()
+                   if i is not None}
+        if "amount" not in columns:
+            raise ValueError("Column mapping has no amount column.")
+        header_row = overrides.get("header_row")
+        header_idx = header_row if isinstance(header_row, int) and header_row >= 0 else -1
+        if header_idx >= len(buffered):
+            raise ValueError("Column mapping header row is outside the file.")
+
+        self._headers = buffered[header_idx] if header_idx >= 0 else []
+        self._chosen = columns
+        self._header_idx = header_idx
+        self._pending = buffered[header_idx + 1:]
+        amount_idx = columns["amount"]
+        self._header_currency = (
+            detect_currency(None, self._headers[amount_idx])
+            if amount_idx < len(self._headers) else None
+        )
+        if not any(f in columns for f in ("income_type", "source", "description")):
+            self._text_cols = _text_columns(self._pending, exclude=set(columns.values()))
+        self.column_map = {f: self._col_name(i) for f, i in columns.items()}
+        described = ", ".join(f"{f}: {self._col_name(i)}" for f, i in columns.items())
+        self.warnings.append(
+            f"Columns identified by Claude ({described}). "
+            "Spot-check a few transactions with /trace."
+        )
+        if "date" not in columns:
+            self.warnings.append(
+                "No date/period column recognized - rows will need manual review."
+            )
 
     def _col_name(self, idx: int) -> str:
         if idx < len(self._headers) and self._headers[idx]:
@@ -732,6 +769,46 @@ def parse_file(path: str | Path, filename: str | None = None) -> ParseResult:
         column_map=dict(reader.column_map),
         warnings=reader.finalize_warnings(),
     )
+
+
+def preview_rows(path: str | Path, limit: int = 25) -> list[list[str]]:
+    """First rows of the file's first sheet, for AI layout mapping."""
+    sheets, close = _sheet_iterators(Path(path))
+    try:
+        if not sheets:
+            return []
+        _, rows_iter = sheets[0]
+        out: list[list[str]] = []
+        for row in rows_iter:
+            out.append(row)
+            if len(out) >= limit:
+                break
+        return out
+    finally:
+        close()
+
+
+def layout_signature(rows: list[list[str]], suffix: str) -> str:
+    """Structural fingerprint of a statement layout.
+
+    Files exported from the same system share a signature even though their
+    values differ, so an AI-derived column mapping can be cached and reused
+    across a whole batch of statements."""
+    ncols = max((len(r) for r in rows), default=0)
+    pattern = []
+    for col in range(ncols):
+        vals = _column_values(rows, col)
+        if not vals:
+            pattern.append("e")
+        elif sum(_looks_like_money(v) for v in vals) / len(vals) >= 0.5:
+            pattern.append("m")
+        elif sum(_plausible_date(v) for v in vals) / len(vals) >= 0.5:
+            pattern.append("d")
+        elif sum(any(ch.isalpha() for ch in v) for v in vals) / len(vals) >= 0.5:
+            pattern.append("a")
+        else:
+            pattern.append("n")
+    return f"{suffix.lower()}:{ncols}:{''.join(pattern)}"
 
 
 def file_sha256(path: str | Path) -> str:

@@ -72,6 +72,12 @@ CREATE TABLE IF NOT EXISTS transactions (
     raw_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS layout_maps (
+    signature TEXT PRIMARY KEY,
+    mapping TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_txn_fingerprint ON transactions (chat_id, fingerprint);
 CREATE INDEX IF NOT EXISTS idx_txn_file ON transactions (file_id);
 -- Covering indexes so /report aggregates never touch the (wide) table rows.
@@ -355,14 +361,32 @@ class Store:
             (str(chat_id), txn_id),
         ).fetchone()
 
-    def set_category(self, chat_id: str | int, txn_id: int, category: str) -> bool:
+    def set_category(self, chat_id: str | int, txn_id: int, category: str,
+                     reason: str = "manually set") -> bool:
         cur = self.conn.execute(
             "UPDATE transactions SET category=?, manual_category=1, "
-            "category_reason='manually set' WHERE chat_id=? AND id=?",
-            (category, str(chat_id), txn_id),
+            "category_reason=? WHERE chat_id=? AND id=?",
+            (category, reason, str(chat_id), txn_id),
         )
         self.conn.commit()
         return cur.rowcount > 0
+
+    # ------------------------------------------------------------------ layouts
+
+    def get_layout(self, signature: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT mapping FROM layout_maps WHERE signature=?", (signature,)
+        ).fetchone()
+        return json.loads(row["mapping"]) if row else None
+
+    def save_layout(self, signature: str, mapping: dict) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO layout_maps (signature, mapping, created_at) "
+            "VALUES (?,?,?)",
+            (signature, json.dumps(mapping),
+             datetime.now(timezone.utc).isoformat(timespec="seconds")),
+        )
+        self.conn.commit()
 
     def files(self, chat_id: str | int):
         return self.conn.execute(
